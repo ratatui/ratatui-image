@@ -4,11 +4,12 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
+    num::NonZeroU16,
 };
 
 use image::{DynamicImage, ImageBuffer, Rgba, imageops};
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer, CellDiffOption},
     layout::{Rect, Size},
 };
 
@@ -26,6 +27,8 @@ pub mod halfblocks;
 pub mod iterm2;
 pub mod kitty;
 pub mod sixel;
+
+const UNIT_WIDTH: CellDiffOption = CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap());
 
 pub(crate) trait ProtocolTrait: Send + Sync {
     /// Render the currently resized and encoded data to the buffer.

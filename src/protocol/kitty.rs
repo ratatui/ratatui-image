@@ -9,8 +9,10 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::protocol::UNIT_WIDTH;
 use crate::{Result, picker::cap_parser::Parser};
 use image::DynamicImage;
+use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Size;
 use ratatui::{buffer::Buffer, layout::Rect};
 
@@ -201,14 +203,14 @@ fn render(
         for x in 1..full_width {
             // Skip or something may overwrite it
             if let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) {
-                cell.set_skip(true);
+                cell.set_diff_option(CellDiffOption::Skip);
             }
         }
 
         symbol.push_str(&restore_cursor);
 
         if let Some(cell) = buf.cell_mut((area.left(), area.top() + y)) {
-            cell.set_symbol(&symbol);
+            cell.set_symbol(&symbol).set_diff_option(UNIT_WIDTH);
         }
     }
 }

@@ -3,12 +3,12 @@
 //! Delivers the full raw png image on every render.
 use image::DynamicImage;
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer, CellDiffOption},
     layout::{Rect, Size},
 };
 use std::{cmp::min, fmt::Write, io::Cursor};
 
-use crate::{Result, picker::cap_parser::Parser};
+use crate::{Result, picker::cap_parser::Parser, protocol::UNIT_WIDTH};
 
 use super::{ProtocolTrait, StatefulProtocolTrait, clear_area};
 
@@ -79,19 +79,18 @@ fn render(size: Size, data: &str, area: Rect, buf: &mut Buffer, overdraw: bool) 
         Some(r) => r,
     };
 
-    buf.cell_mut(render_area).map(|cell| cell.set_symbol(data));
-
-    for x in (render_area.left() + 1)..render_area.right() {
-        if let Some(cell) = buf.cell_mut((x, render_area.top())) {
-            cell.set_skip(true);
-        }
+    if let Some(cell) = buf.cell_mut(render_area) {
+        cell.set_symbol(data).set_diff_option(UNIT_WIDTH);
     }
 
-    // Skip entire area
-    for y in (render_area.top() + 1)..render_area.bottom() {
+    // Skip entire area (except first cell)
+    for y in render_area.top()..render_area.bottom() {
         for x in render_area.left()..render_area.right() {
+            if x == render_area.left() && y == render_area.top() {
+                continue;
+            }
             if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_skip(true);
+                cell.set_diff_option(CellDiffOption::Skip);
             }
         }
     }
