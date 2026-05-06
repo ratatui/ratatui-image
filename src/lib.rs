@@ -77,11 +77,11 @@
 //! # Widget choice
 //! * The [Image] widget has a fixed size in rows/columns. If the image pixel size exceeds the
 //!   pixel area of the rows/columns, the image is scaled down proportionally to "fit" once.
-//!   If the actual rendering area is smaller than the initial rows/columns, it is simply not
-//!   rendered at all.
 //!   The big upside is that this widget is _stateless_ (in terms of ratatui, i.e. immediate-mode),
 //!   and thus can never block the rendering thread/task. A lot of ratatui apps only use stateless
 //!   widgets, so this factor is also important when chosing.
+//!   **Platform note** On the iterm2 and sixel protocols, if the actual rendering area is smaller than the initial rows/columns, it is simply not
+//!   rendered at all. Whereas, on kitty protocol or when falling back to halfblocks, the image is cropped to fit the rendering area.
 //! * The [StatefulImage] widget adapts to its render area at render-time. It can be set to fit,
 //!   crop, or scale to the available render area.
 //!   This means the widget must be stateful, i.e. use `render_stateful_widget` which takes a
@@ -178,6 +178,10 @@ impl From<(u16, u16)> for FontSize {
 ///
 /// The widget does **not** react to area resizes.
 /// Its advantage lies in that the [Protocol] needs only one initial resize.
+///
+/// # Platform note
+/// On the iterm2 and sixel protocols, if the actual rendering area is smaller than the initial rows/columns, it is simply not
+/// rendered at all. Whereas, on kitty protocol or when falling back to halfblocks, the image is cropped to fit the rendering area.
 ///
 /// ```rust
 /// # use ratatui::Frame;
