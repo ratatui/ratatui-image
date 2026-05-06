@@ -180,7 +180,7 @@ impl From<(u16, u16)> for FontSize {
 /// Its advantage lies in that the [Protocol] needs only one initial resize.
 ///
 /// # Platform note
-/// /// On the iterm2 and sixel protocols, if the actual rendering area is smaller than the initial rows/columns, it is simply not
+/// On the iterm2 and sixel protocols, if the actual rendering area is smaller than the initial rows/columns, it is simply not
 /// rendered at all. Whereas, on kitty protocol or when falling back to halfblocks, the image is cropped to fit the rendering area.
 ///
 /// ```rust
