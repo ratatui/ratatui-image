@@ -3,7 +3,9 @@ use crate::{
     FontSize, Resize,
     errors::Errors,
     picker::{Picker, ProtocolType},
-    protocol::{ImageSource, Protocol, halfblocks::Halfblocks, kitty::Kitty, sixel::Sixel},
+    protocol::{
+        ImageSource, Protocol, ProtocolTrait, halfblocks::Halfblocks, kitty::Kitty, sixel::Sixel,
+    },
     sliced::sixel_slice::SlicedSixel,
 };
 use image::DynamicImage;
@@ -17,7 +19,6 @@ use ratatui::{
 /// Uses a specialized [`SlicedProtocol`] with specialized operations based on the protocol.
 pub struct SlicedImage<'a> {
     sliced_protocol: &'a SlicedProtocol,
-    size: Size,
     position: i16,
 }
 impl<'a> SlicedImage<'a> {
@@ -33,29 +34,24 @@ impl<'a> SlicedImage<'a> {
     /// # use ratatui::layout::Size;
     /// # use ratatui_image::sliced::{SlicedProtocol, SlicedImage};
     /// # let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))?;
-    /// let picker = Picker::halfblocks(); // Note: use from_query_studio
+    /// # let picker = Picker::halfblocks();
     /// let dyn_img = image::ImageReader::open("./assets/NixOS.png")?.decode()?;
-    /// let font_size = picker.font_size();
+    ///
     /// // This example would render the image at its actual pixel size.
-    /// let size = Size::new(
-    ///     dyn_img.width().div_ceil(font_size.width as u32) as u16,
-    ///     dyn_img.height().div_ceil(font_size.height as u32) as u16,
-    /// );
-    /// let sliced = SlicedProtocol::new(&picker, dyn_img, size)?;
+    /// let sliced = SlicedProtocol::new(&picker, dyn_img, None)?;
     ///
     /// terminal.draw(|f| {
     ///     let position = -3;
-    ///     f.render_widget(SlicedImage::new(&sliced, size, position), f.area());
+    ///     f.render_widget(SlicedImage::new(&sliced, position), f.area());
     /// });
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// The same works for e.g. ending N lines below viewport, or within any other inner area of
     /// the TUI.
-    pub fn new(sliced_protocol: &'a SlicedProtocol, size: Size, position: i16) -> SlicedImage<'a> {
+    pub fn new(sliced_protocol: &'a SlicedProtocol, position: i16) -> SlicedImage<'a> {
         SlicedImage {
             sliced_protocol,
-            size,
             position,
         }
     }
@@ -68,14 +64,16 @@ impl Widget for SlicedImage<'_> {
     {
         use crate::protocol::ProtocolTrait;
 
-        let mut image_area: Rect = self.size.into();
+        let mut image_area: Rect = self.sliced_protocol.size().into();
         image_area.x = area.x;
         image_area.y = area.y;
 
         match &self.sliced_protocol {
             SlicedProtocol::Kitty(kitty) => {
                 let skip_line_count = if self.position < 0 {
-                    image_area.height -= self.position.unsigned_abs();
+                    image_area.height = image_area
+                        .height
+                        .saturating_sub(self.position.unsigned_abs());
                     self.position.unsigned_abs()
                 } else {
                     image_area.y += self.position as u16;
@@ -167,11 +165,21 @@ pub enum SlicedProtocol {
 
 impl SlicedProtocol {
     /// Create a `SlicedProtocol` for the target [`ratatui::layout::Size`].
+    ///
+    /// If `size` is omitted, it will be calculated based on `dyn_img`'s image-pixel-size and
+    /// `picker.font_size()`.
     pub fn new(
         picker: &Picker,
         dyn_img: DynamicImage,
-        size: Size,
+        size: Option<Size>,
     ) -> Result<SlicedProtocol, Errors> {
+        let size = size.unwrap_or_else(|| {
+            let font_size = picker.font_size();
+            Size::new(
+                dyn_img.width().div_ceil(font_size.width as u32) as u16,
+                dyn_img.height().div_ceil(font_size.height as u32) as u16,
+            )
+        });
         match picker.protocol_type() {
             ProtocolType::Kitty => {
                 let Protocol::Kitty(kitty) =
@@ -222,6 +230,18 @@ impl SlicedProtocol {
 
                 Ok(SlicedProtocol::Sliced(rows))
             }
+        }
+    }
+
+    pub fn size(&self) -> Size {
+        match self {
+            SlicedProtocol::Sliced(protos) => Size::new(
+                protos.first().map(|p| p.size().width).unwrap_or_default(),
+                protos.len() as u16,
+            ),
+            SlicedProtocol::Halfblocks(hb) => hb.size(),
+            SlicedProtocol::Kitty(kitty) => kitty.size(),
+            SlicedProtocol::Sixel(sixel_slice) => sixel_slice.borrow_owner().size(),
         }
     }
 

@@ -15,7 +15,6 @@ use ratatui_image::{
 
 struct App {
     sliced: SlicedProtocol,
-    size: Size,
     position: i16,
     background_text: Vec<String>,
     stopped: bool,
@@ -26,16 +25,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let picker = Picker::from_query_stdio()?;
     let dyn_img = image::ImageReader::open("./assets/Ada.png")?.decode()?;
-    let font_size = picker.font_size();
-    let size = Size::new(
-        dyn_img.width().div_ceil(font_size.width as u32) as u16,
-        dyn_img.height().div_ceil(font_size.height as u32) as u16,
-    );
 
     let mut terminal_size = Size::default();
     terminal.draw(|f| {
         terminal_size = f.area().into();
     })?;
+
+    let pixel_size = dyn_img.dimensions();
+    let sliced = SlicedProtocol::new(&picker, dyn_img, None)?;
 
     let mut background_text = format!(
         r#"Protocol: {:?}
@@ -47,8 +44,8 @@ terminal: {:?}
 "#,
         picker.protocol_type(),
         picker.font_size(),
-        dyn_img.dimensions(),
-        (size.width, size.height),
+        pixel_size,
+        (sliced.size().width, sliced.size().height),
         (terminal_size.width, terminal_size.height),
     );
     let source = fs::read_to_string("./examples/sliced.rs")?;
@@ -60,11 +57,9 @@ terminal: {:?}
         .map(|(i, line)| format!("{:02}: {}\n", i + 1, line))
         .collect();
 
-    let sliced = SlicedProtocol::new(&picker, dyn_img, size)?;
-
+    let size = sliced.size();
     let mut app = App {
         sliced,
-        size,
         position: -((size.height / 2) as i16),
         background_text: Vec::new(),
         stopped: false,
@@ -107,9 +102,9 @@ terminal: {:?}
         terminal.draw(|f| {
             let inner_height = f.area().height.saturating_sub(2) as i16;
             if app.position >= inner_height {
-                app.position = -(app.size.height as i16);
+                app.position = -(app.sliced.size().height as i16);
             }
-            if app.position < -(app.size.height as i16) {
+            if app.position < -(app.sliced.size().height as i16) {
                 app.position = inner_height - 1;
             }
 
@@ -142,8 +137,5 @@ fn ui(f: &mut Frame<'_>, app: &App) {
         );
     }
 
-    f.render_widget(
-        SlicedImage::new(&app.sliced, app.size, app.position),
-        inner_area,
-    );
+    f.render_widget(SlicedImage::new(&app.sliced, app.position), inner_area);
 }

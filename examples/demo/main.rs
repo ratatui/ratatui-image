@@ -97,8 +97,7 @@ impl App {
         let image_crop_state = picker.new_resize_protocol(image_source.clone());
         let image_scale_state = picker.new_resize_protocol(image_source.clone());
 
-        let size = image_static.size();
-        let image_sliced = SlicedProtocol::new(&picker, image_source.clone(), size).unwrap();
+        let image_sliced = SlicedProtocol::new(&picker, image_source.clone(), None).unwrap();
 
         let mut background = String::new();
 
@@ -118,6 +117,8 @@ impl App {
             background.push(c);
         }
 
+        let image_sliced_position = (0, -((image_sliced.size().height / 2) as i16), true, false);
+
         Self {
             title,
             should_quit: false,
@@ -134,7 +135,7 @@ impl App {
             image_crop_state,
             image_scale_state,
             image_sliced,
-            image_sliced_position: (0, -((size.height / 2) as i16), true, false),
+            image_sliced_position,
             image_sliced_viewport: None,
         }
     }
@@ -197,14 +198,14 @@ impl App {
             }
             'k' => {
                 let (_, y, _, _) = &mut self.image_sliced_position;
-                if *y > 0 || y.unsigned_abs() < self.image_static.size().height - 1 {
+                if *y > 0 || y.unsigned_abs() < self.image_sliced.size().height - 1 {
                     *y -= 1;
                 }
             }
             'l' => {
                 let (x, _, _, _) = &mut self.image_sliced_position;
                 if let Some(viewport) = self.image_sliced_viewport
-                    && *x < viewport.width - self.image_static.size().width
+                    && *x < viewport.width - self.image_sliced.size().width
                 {
                     *x += 1;
                 }
@@ -227,12 +228,8 @@ impl App {
         self.image_fit_state = self.picker.new_resize_protocol(self.image_source.clone());
         self.image_crop_state = self.picker.new_resize_protocol(self.image_source.clone());
         self.image_scale_state = self.picker.new_resize_protocol(self.image_source.clone());
-        self.image_sliced = SlicedProtocol::new(
-            &self.picker,
-            self.image_source.clone(),
-            self.image_static.size(),
-        )
-        .unwrap();
+        self.image_sliced =
+            SlicedProtocol::new(&self.picker, self.image_source.clone(), None).unwrap();
     }
 
     pub fn on_tick(&mut self) -> bool {
@@ -254,14 +251,14 @@ impl App {
                 }
 
                 if *is_moving_rightwards {
-                    if *x >= viewport.width - self.image_static.size().width {
-                        *x = viewport.width - self.image_static.size().width - 1;
+                    if *x >= viewport.width - self.image_sliced.size().width {
+                        *x = viewport.width - self.image_sliced.size().width - 1;
                         *is_moving_rightwards = false;
                     } else {
                         *x += 1;
                     }
                 } else {
-                    *x -= 1;
+                    *x = x.saturating_sub(1);
                     if *x == 0 {
                         *is_moving_rightwards = true;
                     }
@@ -347,13 +344,13 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     );
     f.render_widget(block_middle_top, chunks_left_top[1]);
     if app.show_images != ShowImages::Resized {
-        let size = app.image_static.size();
+        let size = app.image_sliced.size();
         let (x, y, _, _) = app.image_sliced_position;
         if area.width >= x + size.width {
             let mut area = area;
             area.x += x;
             area.width -= x;
-            let image = SlicedImage::new(&app.image_sliced, size, y);
+            let image = SlicedImage::new(&app.image_sliced, y);
             f.render_widget(image, area);
         }
     }
