@@ -27,7 +27,7 @@ use ratatui_image::{
     Image, Resize, StatefulImage,
     picker::Picker,
     protocol::{Protocol, StatefulProtocol},
-    sliced::{SlicedImage, SlicedProtocol},
+    sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -66,7 +66,7 @@ struct App {
     image_crop_state: StatefulProtocol,
     image_scale_state: StatefulProtocol,
     image_sliced: SlicedProtocol,
-    image_sliced_position: (u16, i16, bool, bool), // (x,y, is_moving_rightwards, is_animating)
+    image_sliced_position: (SignedPosition, bool, bool), // (x,y, is_moving_rightwards, is_animating)
     image_sliced_viewport: Option<Size>,
 }
 
@@ -117,7 +117,14 @@ impl App {
             background.push(c);
         }
 
-        let image_sliced_position = (0, -((image_sliced.size().height / 2) as i16), true, false);
+        let image_sliced_position = (
+            SignedPosition {
+                x: 0,
+                y: -((image_sliced.size().height / 2) as i16),
+            },
+            true,
+            false,
+        );
 
         Self {
             title,
@@ -183,38 +190,41 @@ impl App {
                 }
             }
             'h' => {
-                let (x, _, _, _) = &mut self.image_sliced_position;
-                if *x > 0 {
-                    *x -= 1;
+                let (pos, _, _) = &mut self.image_sliced_position;
+                if pos.x > 0 {
+                    pos.x -= 1;
                 }
             }
             'j' => {
-                let (_, y, _, _) = &mut self.image_sliced_position;
+                let (pos, _, _) = &mut self.image_sliced_position;
                 if let Some(viewport) = self.image_sliced_viewport
-                    && (*y < 0 || (*y as u16) < viewport.height.saturating_sub(1))
+                    && (pos.y < 0 || (pos.y as u16) < viewport.height.saturating_sub(1))
                 {
-                    *y += 1;
+                    pos.y += 1;
                 }
             }
             'k' => {
-                let (_, y, _, _) = &mut self.image_sliced_position;
-                if *y > 0 || y.unsigned_abs() < self.image_sliced.size().height.saturating_sub(1) {
-                    *y -= 1;
+                let (pos, _, _) = &mut self.image_sliced_position;
+                if pos.y > 0
+                    || pos.y.unsigned_abs() < self.image_sliced.size().height.saturating_sub(1)
+                {
+                    pos.y -= 1;
                 }
             }
             'l' => {
-                let (x, _, _, _) = &mut self.image_sliced_position;
+                let (pos, _, _) = &mut self.image_sliced_position;
                 if let Some(viewport) = self.image_sliced_viewport
-                    && *x
-                        < viewport
+                    && pos.x
+                        < (viewport
                             .width
                             .saturating_sub(self.image_sliced.size().width)
+                            as i16)
                 {
-                    *x += 1;
+                    pos.x += 1;
                 }
             }
             'a' => {
-                self.image_sliced_position.3 = !self.image_sliced_position.3;
+                self.image_sliced_position.2 = !self.image_sliced_position.2;
             }
             _ => {
                 return false;
@@ -246,29 +256,31 @@ impl App {
         });
 
         if let Some(viewport) = self.image_sliced_viewport {
-            let (x, y, is_moving_rightwards, is_animating) = &mut self.image_sliced_position;
+            let (pos, is_moving_rightwards, is_animating) = &mut self.image_sliced_position;
             if *is_animating {
-                *y += 1;
-                if *y > 0 && y.unsigned_abs() > viewport.height {
-                    *y = -10;
+                pos.y += 1;
+                if pos.y > 0 && pos.y.unsigned_abs() > viewport.height {
+                    pos.y = -10;
                 }
 
                 if *is_moving_rightwards {
-                    if *x
+                    if pos.x
                         >= viewport
                             .width
                             .saturating_sub(self.image_sliced.size().width)
+                            as i16
                     {
-                        *x = viewport
+                        pos.x = viewport
                             .width
-                            .saturating_sub(self.image_sliced.size().width + 1);
+                            .saturating_sub(self.image_sliced.size().width + 1)
+                            as i16;
                         *is_moving_rightwards = false;
                     } else {
-                        *x += 1;
+                        pos.x += 1;
                     }
                 } else {
-                    *x = x.saturating_sub(1);
-                    if *x == 0 {
+                    pos.x = pos.x.saturating_sub(1);
+                    if pos.x == 0 {
                         *is_moving_rightwards = true;
                     }
                 }
@@ -353,11 +365,8 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     );
     f.render_widget(block_middle_top, chunks_left_top[1]);
     if app.show_images != ShowImages::Resized {
-        let (x, y, _, _) = app.image_sliced_position;
-        let mut area = area;
-        area.x += x;
-        area.width -= x;
-        let image = SlicedImage::new(&app.image_sliced, y);
+        let (pos, _, _) = app.image_sliced_position;
+        let image = SlicedImage::new(&app.image_sliced, pos);
         f.render_widget(image, area);
     }
 

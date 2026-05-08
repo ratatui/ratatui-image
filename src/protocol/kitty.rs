@@ -61,7 +61,7 @@ impl Kitty {
     }
 
     /// Only for SlicedImage
-    pub(crate) fn render_with_skip(&self, area: Rect, buf: &mut Buffer, skip_line_count: u16) {
+    pub(crate) fn render_with_skip(&self, area: Rect, buf: &mut Buffer, skip_line_count: usize) {
         // Transmit only once. This is why self is mut.
         let seq = self.proto_state.make_transmit();
 
@@ -139,7 +139,7 @@ fn render(
     buf: &mut Buffer,
     (_, id_color, id_extra): &(u32, String, u16),
     mut seq: Option<&str>,
-    skip_line_count: u16,
+    skip_line_count: usize,
 ) {
     let full_width = area.width.min(size.width);
     let width_usize = usize::from(full_width);
@@ -181,7 +181,7 @@ fn render(
             symbol.push_str(seq);
         }
 
-        let row_y = y + skip_line_count;
+        let row_y = y + skip_line_count as u16;
 
         // Save cursor position, including fg color which is what we want, and start the unicode
         // placeholder sequence

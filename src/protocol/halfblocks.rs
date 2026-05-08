@@ -62,9 +62,17 @@ impl Halfblocks {
     }
 
     /// Specialized render for [`crate::sliced::SlicedImage`].
-    pub(crate) fn render_with_skip(&self, area: Rect, buf: &mut Buffer, skip_line_count: u16) {
-        let start = (self.size.width * skip_line_count) as usize;
-        let end = self.size.width as usize * (skip_line_count as usize + area.height as usize);
+    pub(crate) fn render_with_skip(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        skip_line_count: usize,
+        drop_line_count: usize,
+    ) {
+        let start = self.size.width as usize * skip_line_count;
+        let end = start
+            + self.size.width as usize
+                * (self.size.height as usize - skip_line_count - drop_line_count);
         let hbs = &self.data[start..end];
         self.render_halfblocks(hbs, area, buf);
     }

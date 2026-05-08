@@ -19,8 +19,9 @@ use ratatui::{
 /// Uses a specialized [`SlicedProtocol`] with specialized operations based on the protocol.
 pub struct SlicedImage<'a> {
     sliced_protocol: &'a SlicedProtocol,
-    position: i16,
+    position: SignedPosition,
 }
+
 impl<'a> SlicedImage<'a> {
     /// Create a sliced image that will render with the given size at the given position.
     ///
@@ -32,7 +33,7 @@ impl<'a> SlicedImage<'a> {
     /// ```rust
     /// # use ratatui_image::picker::Picker;
     /// # use ratatui::layout::Size;
-    /// # use ratatui_image::sliced::{SlicedProtocol, SlicedImage};
+    /// # use ratatui_image::sliced::{SignedPosition, SlicedProtocol, SlicedImage};
     /// # let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))?;
     /// # let picker = Picker::halfblocks();
     /// let dyn_img = image::ImageReader::open("./assets/NixOS.png")?.decode()?;
@@ -41,7 +42,7 @@ impl<'a> SlicedImage<'a> {
     /// let sliced = SlicedProtocol::new(&picker, dyn_img, None)?;
     ///
     /// terminal.draw(|f| {
-    ///     let position = -3;
+    ///     let position = SignedPosition::from((0, -3));
     ///     f.render_widget(SlicedImage::new(&sliced, position), f.area());
     /// });
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -49,11 +50,30 @@ impl<'a> SlicedImage<'a> {
     ///
     /// The same works for e.g. ending N lines below viewport, or within any other inner area of
     /// the TUI.
-    pub fn new(sliced_protocol: &'a SlicedProtocol, position: i16) -> SlicedImage<'a> {
+    pub fn new(sliced_protocol: &'a SlicedProtocol, position: SignedPosition) -> SlicedImage<'a> {
         SlicedImage {
             sliced_protocol,
             position,
         }
+    }
+
+    fn skip_and_drop(size: Size, position: SignedPosition, area: Rect) -> Option<(usize, usize)> {
+        if area.height == 0 || area.width == 0 {
+            return None;
+        }
+        let top = position.y;
+        let bottom = position.y + size.height as i16;
+        let area_top = 0;
+        let area_bottom = area.height as i16;
+
+        if top >= area_bottom || bottom <= area_top {
+            return None;
+        }
+
+        let skip = (area_top - top).max(0) as usize;
+        let drop = (bottom - area_bottom).max(0) as usize;
+
+        Some((skip, drop))
     }
 }
 
@@ -62,84 +82,54 @@ impl Widget for SlicedImage<'_> {
     where
         Self: Sized,
     {
-        use crate::protocol::ProtocolTrait;
+        let size = self.sliced_protocol.size();
+        let Some((skip_line_count, drop_line_count)) =
+            Self::skip_and_drop(size, self.position, area)
+        else {
+            return;
+        };
 
-        let mut image_area: Rect = self.sliced_protocol.size().into();
-        image_area.x = area.x;
-        image_area.y = area.y;
-        image_area.width = image_area.width.min(area.width);
+        let x = self.position.x.max(0) as u16;
+        let y = self.position.y.max(0) as u16;
+        let image_area = Rect::new(
+            area.x + x.min(area.width),
+            area.y + y.min(area.height),
+            (x + size.width).min(area.width) - x,
+            size.height
+                .saturating_sub((skip_line_count + drop_line_count) as u16),
+        );
 
         match &self.sliced_protocol {
             SlicedProtocol::Kitty(kitty) => {
-                let skip_line_count = if self.position < 0 {
-                    image_area.height = image_area
-                        .height
-                        .saturating_sub(self.position.unsigned_abs());
-                    self.position.unsigned_abs()
-                } else {
-                    image_area.y += self.position as u16;
-                    image_area.height =
-                        (area.height - self.position.unsigned_abs()).min(kitty.size().height);
-                    0
-                };
-                if image_area.height > 0 {
-                    kitty.render_with_skip(image_area, buf, skip_line_count);
-                }
+                kitty.render_with_skip(image_area, buf, skip_line_count);
             }
-            SlicedProtocol::Sliced(proto_slice) => {
-                let range = if self.position < 0 {
-                    (self.position.unsigned_abs() as usize)..proto_slice.len()
-                } else {
-                    image_area.y += self.position.unsigned_abs();
-                    0..((area.height - self.position.unsigned_abs()) as usize)
-                        .min(proto_slice.len())
-                };
-
-                let mut area = image_area;
-                area.height = 1;
-                for i in range {
-                    proto_slice[i].render(area, buf);
-                    area.y += 1;
+            SlicedProtocol::Sliced(slices) => {
+                let mut image_area = Rect::new(x, y, image_area.width, 1);
+                for slice in slices.iter().skip(skip_line_count).take(drop_line_count) {
+                    slice.render(image_area, buf);
+                    image_area.y += 1;
                 }
             }
             SlicedProtocol::Sixel(sliced_sixel) => {
-                let sixel = sliced_sixel.borrow_owner();
-                let skip_line_count = if self.position < 0 {
-                    image_area.height = image_area
-                        .height
-                        .saturating_sub(self.position.unsigned_abs());
-                    self.position.unsigned_abs()
-                } else {
-                    image_area.y += self.position as u16;
-                    image_area.height = (area.height.saturating_sub(self.position.unsigned_abs()))
-                        .min(sixel.size().height);
-                    0
-                };
-                if image_area.height > 0 {
-                    if skip_line_count == 0 && image_area.height >= sixel.size().height {
-                        sixel.render(image_area, buf);
-                    } else {
-                        let sliced = sliced_sixel.borrow_dependent();
-                        sliced.render(image_area, buf, skip_line_count, image_area.height);
-                    }
-                }
+                let sliced = sliced_sixel.borrow_dependent();
+                sliced.render(image_area, buf, skip_line_count, drop_line_count);
             }
             SlicedProtocol::Halfblocks(halfblocks) => {
-                let skip_line_count = if self.position < 0 {
-                    image_area.height = image_area
-                        .height
-                        .saturating_sub(self.position.unsigned_abs());
-                    self.position.unsigned_abs()
-                } else {
-                    image_area.y += self.position as u16;
-                    image_area.height = (area.height.saturating_sub(self.position.unsigned_abs()))
-                        .min(halfblocks.size().height);
-                    0
-                };
-
-                halfblocks.render_with_skip(image_area, buf, skip_line_count);
+                halfblocks.render_with_skip(image_area, buf, skip_line_count, drop_line_count);
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SignedPosition {
+    pub x: i16,
+    pub y: i16,
+}
+
+impl From<(i16, i16)> for SignedPosition {
+    fn from((x, y): (i16, i16)) -> Self {
+        Self { x, y }
     }
 }
 
@@ -287,9 +277,7 @@ fn slice_rows(image: DynamicImage, font_size: FontSize, size: Size) -> (Vec<Dyna
 /// six pixel columns of data. Therefore it's easy to remove some sixel bands anywhere in the
 /// image, for vertical clipping.
 mod sixel_slice {
-    use std::cmp::min;
-
-    use ratatui::layout::{Rect, Size};
+    use ratatui::layout::Size;
     use self_cell::self_cell;
 
     use crate::{
@@ -320,34 +308,34 @@ mod sixel_slice {
             &self,
             area: ratatui::prelude::Rect,
             buf: &mut ratatui::prelude::Buffer,
-            skip_line_count: u16,
-            area_height: u16,
+            skip_line_count: usize,
+            drop_line_count: usize,
         ) {
             if self.size.width > area.width {
                 return;
             }
-            let area = Rect::new(
-                area.x,
-                area.y,
-                min(self.size.width, area.width),
-                min(self.size.height, area.height),
-            );
 
-            let data = self.to_sequence(skip_line_count, area_height, area.width);
+            let data = self.to_sequence(skip_line_count, drop_line_count, area.width, area.height);
             sixel::render(&data, area, buf);
         }
 
-        pub fn to_sequence(&self, skip_line_count: u16, area_height: u16, width: u16) -> String {
+        pub fn to_sequence(
+            &self,
+            skip_line_count: usize,
+            drop_line_count: usize,
+            width: u16,
+            height: u16,
+        ) -> String {
             let (start, escape, end) = Parser::tmux_start_escape_end(self.is_tmux);
 
-            let skip_bands = (skip_line_count * self.font_height).div_ceil(6) as usize;
-            let take_bands = ((area_height * self.font_height) / 6) as usize;
-
+            let skip_bands = (skip_line_count * self.font_height as usize).div_ceil(6);
             let available = self.bands.len().saturating_sub(skip_bands);
-            let take_bands = take_bands.min(available);
+
+            let take_bands =
+                available.saturating_sub((drop_line_count * self.font_height as usize) / 6);
 
             let mut data = String::from(start);
-            clear_area(&mut data, escape, width, area_height);
+            clear_area(&mut data, escape, width, height);
             data.push_str(self.header);
 
             let sliced_bands: Vec<&str> = self
@@ -363,7 +351,6 @@ mod sixel_slice {
             if !sliced_bands.is_empty() {
                 data.push('-');
             }
-            data.push('-');
             data.push('\x1b');
             data.push('\\');
             data.push_str(end);
@@ -508,20 +495,27 @@ mod sixel_slice {
                 let sixel = Sixel::new(dyn_img, size, false).unwrap();
                 SlicedSixel::from_sixel(sixel, font_size.height, false)
             });
-            for sliced in sliced_sixels {
-                let source = &sliced.borrow_owner().data;
-                // let sliced = slice(&source, 0, size.height, font_size.height);
-                let sliced = sliced
-                    .borrow_dependent()
-                    .to_sequence(0, size.height, size.width);
-                eprintln!("source: {}", source.replace("\x1b", "<esc>"));
-                eprintln!("sliced: {}", sliced.replace("\x1b", "<esc>"));
+            for sliced_sixel in sliced_sixels {
+                let source = &sliced_sixel.borrow_owner().data;
+                let sliced_sixel_data = sliced_sixel.borrow_dependent();
+                let sliced = sliced_sixel_data.to_sequence(0, 0, size.height, size.width);
                 if sliced != *source {
+                    let mut surrounding = String::new();
                     for (i, char) in source.chars().enumerate() {
+                        if surrounding.len() > 20 {
+                            surrounding = surrounding.split_off(19);
+                        }
+                        surrounding.push(char);
+
                         let Some(sliced_char) = sliced.chars().nth(i) else {
                             panic!("sliced is shorter after {i}");
                         };
-                        assert_eq!(char, sliced_char, "index #{i}");
+                        assert_eq!(
+                            char,
+                            sliced_char,
+                            "index #{i} (surrounding: {})",
+                            surrounding.replace('\x1b', "<esc>")
+                        );
                     }
                     panic!("should have found the first different char");
                 }
@@ -533,6 +527,129 @@ mod sixel_slice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_skip_and_drop() {
+        struct TCase {
+            y: i16,
+            size: u16,                    // height
+            area: u16,                    // height
+            want: Option<(usize, usize)>, // (skip, drop)
+        }
+        for TCase {
+            y,
+            size,
+            area,
+            want,
+        } in [
+            TCase {
+                y: -1,
+                size: 12,
+                area: 10,
+                want: Some((1, 1)),
+            },
+            TCase {
+                y: 0,
+                size: 10,
+                area: 10,
+                want: Some((0, 0)),
+            },
+            TCase {
+                y: 0,
+                size: 5,
+                area: 10,
+                want: Some((0, 0)),
+            },
+            TCase {
+                y: 2,
+                size: 5,
+                area: 10,
+                want: Some((0, 0)),
+            },
+            TCase {
+                y: -1,
+                size: 10,
+                area: 10,
+                want: Some((1, 0)),
+            },
+            TCase {
+                y: -5,
+                size: 10,
+                area: 10,
+                want: Some((5, 0)),
+            },
+            TCase {
+                y: 0,
+                size: 20,
+                area: 10,
+                want: Some((0, 10)),
+            },
+            TCase {
+                y: 5,
+                size: 10,
+                area: 10,
+                want: Some((0, 5)),
+            },
+            TCase {
+                y: 9,
+                size: 1,
+                area: 10,
+                want: Some((0, 0)),
+            },
+            TCase {
+                y: -2,
+                size: 14,
+                area: 10,
+                want: Some((2, 2)),
+            },
+            TCase {
+                y: -10,
+                size: 10,
+                area: 10,
+                want: None,
+            },
+            TCase {
+                y: 10,
+                size: 10,
+                area: 10,
+                want: None,
+            },
+            TCase {
+                y: 11,
+                size: 10,
+                area: 10,
+                want: None,
+            },
+            TCase {
+                y: 0,
+                size: 1,
+                area: 10,
+                want: Some((0, 0)),
+            },
+            TCase {
+                y: -1,
+                size: 1,
+                area: 10,
+                want: None,
+            },
+            TCase {
+                y: 10,
+                size: 1,
+                area: 10,
+                want: None,
+            },
+        ] {
+            assert_eq!(
+                want,
+                SlicedImage::skip_and_drop(
+                    (100, size).into(),
+                    (0, y).into(),
+                    Rect::new(0, 0, 100, area),
+                ),
+                "position.y:{y}, size.y:{size}, area.height:{area}",
+            );
+        }
+    }
 
     #[test]
     fn test_slice_rows_basic() {

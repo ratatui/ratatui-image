@@ -10,12 +10,12 @@ use ratatui::{
 };
 use ratatui_image::{
     picker::Picker,
-    sliced::{SlicedImage, SlicedProtocol},
+    sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 
 struct App {
     sliced: SlicedProtocol,
-    position: i16,
+    position: SignedPosition,
     background_text: Vec<String>,
     stopped: bool,
 }
@@ -60,7 +60,7 @@ terminal: {:?}
     let size = sliced.size();
     let mut app = App {
         sliced,
-        position: -((size.height / 2) as i16),
+        position: (0, -((size.height / 2) as i16)).into(),
         background_text: Vec::new(),
         stopped: false,
     };
@@ -78,12 +78,12 @@ terminal: {:?}
                         }
                         KeyCode::Char('j') => {
                             app.stopped = true;
-                            app.position += 1;
+                            app.position.y += 1;
                             had_event = true;
                         }
                         KeyCode::Char('k') => {
                             app.stopped = true;
-                            app.position -= 1;
+                            app.position.y -= 1;
                             had_event = true;
                         }
                         _ => {}
@@ -96,16 +96,16 @@ terminal: {:?}
             continue;
         }
         if !app.stopped {
-            app.position += 1;
+            app.position.y += 1;
         }
 
         terminal.draw(|f| {
             let inner_height = f.area().height.saturating_sub(2) as i16;
-            if app.position >= inner_height {
-                app.position = -(app.sliced.size().height as i16);
+            if app.position.y >= inner_height {
+                app.position.y = -(app.sliced.size().height as i16);
             }
-            if app.position < -(app.sliced.size().height as i16) {
-                app.position = inner_height - 1;
+            if app.position.y < -(app.sliced.size().height as i16) {
+                app.position.y = inner_height - 1;
             }
 
             ui(f, &app)
@@ -121,7 +121,7 @@ fn ui(f: &mut Frame<'_>, app: &App) {
     let area = f.area();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("Scliced imaged on Y position {}", app.position))
+        .title(format!("Scliced imaged on Y position {}", app.position.y))
         .bg(Color::Blue);
     let inner_area = block.inner(area);
     f.render_widget(block, area);
