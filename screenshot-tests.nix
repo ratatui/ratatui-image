@@ -6,6 +6,7 @@ let
 
     nodes.machine = { pkgs, ... }: {
       virtualisation.memorySize = 4096;
+      virtualisation.resolution = { x = 2560; y = 1440; };
 
       programs.sway = {
         enable = true;
