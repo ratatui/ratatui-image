@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.0-alpha.4](https://github.com/ratatui/ratatui-image/compare/v11.0.0-alpha.3...v11.0.0-alpha.4) - 2026-05-09
+
+### Fixed
+
+- fix SlicedProtocol::Sliced render
+
 ### Changed
 - `Image` does not render with clipping under Kitty or Halfblocks, to be consistent with Sixels and
   ITerm2.
