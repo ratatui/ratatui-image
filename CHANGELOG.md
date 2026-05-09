@@ -4,7 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- `Resize::needs_resize`, confusing, internal detail.
+
+### Changed
+
+- `Resize::render_area` changed to `Resize::size_for`, more in line with 
+  `StatefulProtocol::size_for`.
+
+### Added
+
+- `Resize::natural_size` calculates the "natural" size for an image with the font size.
+
 ## [11.0.0-alpha.4](https://github.com/ratatui/ratatui-image/compare/v11.0.0-alpha.3...v11.0.0-alpha.4) - 2026-05-09
+
+### Removed
+- `ImageSource`, confusing, more of an internal detail of `StatefulProtocol`, some functions 
+  required both this and `FontSize`.
 
 ### Fixed
 
