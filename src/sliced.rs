@@ -3,9 +3,7 @@ use crate::{
     FontSize, Resize,
     errors::Errors,
     picker::{Picker, ProtocolType},
-    protocol::{
-        ImageSource, Protocol, ProtocolTrait, halfblocks::Halfblocks, kitty::Kitty, sixel::Sixel,
-    },
+    protocol::{Protocol, ProtocolTrait, halfblocks::Halfblocks, kitty::Kitty, sixel::Sixel},
     sliced::sixel_slice::SlicedSixel,
 };
 use image::DynamicImage;
@@ -187,18 +185,25 @@ impl SlicedProtocol {
             }
             ProtocolType::Sixel => {
                 let font_size = picker.font_size();
-                let source = ImageSource::new(dyn_img, font_size, image::Rgba([0, 0, 0, 0]));
                 let resize = Resize::Fit(None);
 
-                let (dyn_img, _area) =
-                    match resize.needs_resize(&source, font_size, source.desired, size, false) {
-                        Some(area) => {
-                            let dyn_img =
-                                resize.resize(&source, font_size, area, image::Rgba([0, 0, 0, 0]));
-                            (dyn_img, area)
-                        }
-                        None => (source.image, source.desired),
-                    };
+                let desired =
+                    Resize::round_pixel_size_to_cells(dyn_img.width(), dyn_img.height(), font_size);
+                let (dyn_img, _area) = match resize.needs_resize(
+                    &dyn_img,
+                    Some(desired),
+                    font_size,
+                    None,
+                    size,
+                    false,
+                ) {
+                    Some(area) => {
+                        let dyn_img =
+                            resize.resize(&dyn_img, font_size, area, image::Rgba([0, 0, 0, 0]));
+                        (dyn_img, area)
+                    }
+                    None => (dyn_img, desired),
+                };
 
                 let sixel = Sixel::new(dyn_img, size, picker.is_tmux)?;
 
@@ -456,11 +461,7 @@ mod sixel_slice {
         use image::Rgba;
         use ratatui::layout::Size;
 
-        use crate::{
-            FontSize, Resize,
-            protocol::{ImageSource, sixel::Sixel},
-            sliced::sixel_slice::SlicedSixel,
-        };
+        use crate::{FontSize, Resize, protocol::sixel::Sixel, sliced::sixel_slice::SlicedSixel};
 
         #[test]
         fn test_sixel_slice_bands() {
@@ -494,9 +495,8 @@ mod sixel_slice {
             let font_size = FontSize::new(8, 16);
             let sliced_sixels = images.map(|p| {
                 let dyn_img = image::ImageReader::open(p).unwrap().decode().unwrap();
-                let source = ImageSource::new(dyn_img, font_size, Rgba([0, 0, 0, 0]));
                 let dyn_img =
-                    Resize::Fit(None).resize(&source, font_size, size, Rgba([0, 0, 0, 0]));
+                    Resize::Fit(None).resize(&dyn_img, font_size, size, Rgba([0, 0, 0, 0]));
                 let sixel = Sixel::new(dyn_img, size, false).unwrap();
                 SlicedSixel::from_sixel(sixel, font_size.height, false)
             });

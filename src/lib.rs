@@ -149,7 +149,7 @@ use std::{
 };
 
 use image::{DynamicImage, ImageBuffer, Rgba, imageops};
-use protocol::{ImageSource, Protocol};
+use protocol::Protocol;
 use ratatui::{
     buffer::Buffer,
     layout::{Rect, Size},
@@ -282,6 +282,7 @@ pub trait ResizeEncodeRender {
 
     /// Render the currently resized and encoded data to the buffer.
     fn render(&mut self, area: Rect, buf: &mut Buffer);
+
     /// Check if the current image state would need resizing (grow or shrink) for the given area.
     ///
     /// This can be called by the UI thread to check if this [protocol::StatefulProtocol] should be sent off
@@ -400,10 +401,10 @@ pub struct CropOptions {
 }
 
 impl Resize {
-    /// Resize [`ImageSource`] to fit the `area`.
+    /// Resize [`image::DynamicImage`] to fit the `size`.
     fn resize(
         &self,
-        source: &ImageSource,
+        image: &DynamicImage,
         font_size: FontSize,
         size: Size,
         background_color: Rgba<u8>,
@@ -412,7 +413,7 @@ impl Resize {
         let height = (size.height * font_size.height) as u32;
 
         // Resize/Crop/etc., fitting a multiple of font-size, but not necessarily the area.
-        let mut image = self.resize_image(source, width, height);
+        let mut image = self.resize_image(image, width, height);
 
         if image.width() != width || image.height() != height {
             let mut bg: DynamicImage =
@@ -423,61 +424,67 @@ impl Resize {
         image
     }
 
-    /// Check if [`ImageSource`]'s "desired" fits into `area` and is different than `current`.
+    /// Check if [`image::DynamicImage`]'s "desired" fits into `target` and is different than `current`.
     ///
     /// The returned `Size` is the area the image needs to be resized to, depending on the resize
-    /// type.
+    /// type, or `None` if the image matches `target` perfectly at the [`FontSize`].
     pub fn needs_resize(
         &self,
-        image: &ImageSource,
+        image: &DynamicImage,
+        desired: Option<Size>,
         font_size: FontSize,
-        current: Size,
-        size: Size,
+        current: Option<Size>,
+        target: Size,
         force: bool,
     ) -> Option<Size> {
-        let desired = image.desired;
+        let desired = desired.unwrap_or_else(|| {
+            Self::round_pixel_size_to_cells(image.width(), image.height(), font_size)
+        });
+
         // Check if resize is needed at all.
         if !force
             && !matches!(self, &Resize::Scale(_))
-            && desired.width <= size.width
-            && desired.height <= size.height
-            && desired == current
+            && desired.width <= target.width
+            && desired.height <= target.height
+            && (current.is_none() || current == Some(desired))
         {
             let width = (desired.width * font_size.width) as u32;
             let height = (desired.height * font_size.height) as u32;
-            if image.image.width() == width || image.image.height() == height {
+            if image.width() == width || image.height() == height {
                 return None;
             }
         }
 
-        let rect = self.render_area(image, font_size, size);
-        debug_assert!(rect.width <= size.width, "needs_resize exceeds area width");
+        let rect = self.render_area(image, font_size, target);
         debug_assert!(
-            rect.height <= size.height,
+            rect.width <= target.width,
+            "needs_resize exceeds area width"
+        );
+        debug_assert!(
+            rect.height <= target.height,
             "needs_resize exceeds area height"
         );
-        if force || rect != current {
+        if force || Some(rect) != current {
             return Some(rect);
         }
         None
     }
 
-    pub fn render_area(&self, image: &ImageSource, font_size: FontSize, available: Size) -> Size {
+    pub fn render_area(&self, image: &DynamicImage, font_size: FontSize, available: Size) -> Size {
         let (width, height) = self.needs_resize_pixels(
-            &image.image,
+            image,
             (available.width as u32) * (font_size.width as u32),
             (available.height as u32) * (font_size.height as u32),
         );
-        ImageSource::round_pixel_size_to_cells(width, height, font_size)
+        Self::round_pixel_size_to_cells(width, height, font_size)
     }
 
-    fn resize_image(&self, source: &ImageSource, width: u32, height: u32) -> DynamicImage {
+    fn resize_image(&self, image: &DynamicImage, width: u32, height: u32) -> DynamicImage {
         const DEFAULT_FILTER_TYPE: FilterType = FilterType::Nearest;
         const DEFAULT_CROP_OPTIONS: CropOptions = CropOptions {
             clip_top: false,
             clip_left: false,
         };
-        let image = &source.image;
         match self {
             Self::Fit(filter_type) | Self::Scale(filter_type) => {
                 image.resize(width, height, filter_type.unwrap_or(DEFAULT_FILTER_TYPE))
@@ -511,6 +518,13 @@ impl Resize {
             Self::Crop(_) => (min(image.width(), width), min(image.height(), height)),
             Self::Scale(_) => fit_area_proportionally(image.width(), image.height(), width, height),
         }
+    }
+
+    /// Round an image pixel size to the nearest matching cell size, given a font size.
+    fn round_pixel_size_to_cells(img_width: u32, img_height: u32, font_size: FontSize) -> Size {
+        let width = (img_width as f32 / font_size.width as f32).ceil() as u16;
+        let height = (img_height as f32 / font_size.height as f32).ceil() as u16;
+        Size::new(width, height)
     }
 }
 
@@ -550,10 +564,10 @@ mod tests {
 
     const FONT_SIZE: FontSize = FontSize::new(10, 10);
 
-    fn s(w: u16, h: u16) -> ImageSource {
+    fn s(w: u16, h: u16) -> DynamicImage {
         let image: DynamicImage =
             ImageBuffer::from_pixel(w as _, h as _, Rgba::<u8>([255, 0, 0, 255])).into();
-        ImageSource::new(image, FONT_SIZE, [0, 0, 0, 0].into())
+        image
     }
 
     fn r(w: u16, h: u16) -> Size {
@@ -564,31 +578,94 @@ mod tests {
     fn needs_resize_fit() {
         let resize = Resize::Fit(None);
 
-        let to = resize.needs_resize(&s(100, 100), FONT_SIZE, r(10, 10), r(10, 10), false);
+        let to = resize.needs_resize(
+            &s(100, 100),
+            None,
+            FONT_SIZE,
+            Some(r(10, 10)),
+            r(10, 10),
+            false,
+        );
         assert_eq!(None, to);
 
-        let to = resize.needs_resize(&s(101, 101), FONT_SIZE, r(10, 10), r(10, 10), false);
+        let to = resize.needs_resize(
+            &s(101, 101),
+            None,
+            FONT_SIZE,
+            Some(r(10, 10)),
+            r(10, 10),
+            false,
+        );
         assert_eq!(None, to);
 
-        let to = resize.needs_resize(&s(80, 100), FONT_SIZE, r(8, 10), r(10, 10), false);
+        let to = resize.needs_resize(
+            &s(80, 100),
+            None,
+            FONT_SIZE,
+            Some(r(8, 10)),
+            r(10, 10),
+            false,
+        );
         assert_eq!(None, to);
 
-        let to = resize.needs_resize(&s(100, 100), FONT_SIZE, r(99, 99), r(8, 10), false);
+        let to = resize.needs_resize(
+            &s(100, 100),
+            None,
+            FONT_SIZE,
+            Some(r(99, 99)),
+            r(8, 10),
+            false,
+        );
         assert_eq!(Some(r(8, 8)), to);
 
-        let to = resize.needs_resize(&s(100, 100), FONT_SIZE, r(99, 99), r(10, 8), false);
+        let to = resize.needs_resize(
+            &s(100, 100),
+            None,
+            FONT_SIZE,
+            Some(r(99, 99)),
+            r(10, 8),
+            false,
+        );
         assert_eq!(Some(r(8, 8)), to);
 
-        let to = resize.needs_resize(&s(100, 50), FONT_SIZE, r(99, 99), r(4, 4), false);
+        let to = resize.needs_resize(
+            &s(100, 50),
+            None,
+            FONT_SIZE,
+            Some(r(99, 99)),
+            r(4, 4),
+            false,
+        );
         assert_eq!(Some(r(4, 2)), to);
 
-        let to = resize.needs_resize(&s(50, 100), FONT_SIZE, r(99, 99), r(4, 4), false);
+        let to = resize.needs_resize(
+            &s(50, 100),
+            None,
+            FONT_SIZE,
+            Some(r(99, 99)),
+            r(4, 4),
+            false,
+        );
         assert_eq!(Some(r(2, 4)), to);
 
-        let to = resize.needs_resize(&s(100, 100), FONT_SIZE, r(8, 8), r(11, 11), false);
+        let to = resize.needs_resize(
+            &s(100, 100),
+            None,
+            FONT_SIZE,
+            Some(r(8, 8)),
+            r(11, 11),
+            false,
+        );
         assert_eq!(Some(r(10, 10)), to);
 
-        let to = resize.needs_resize(&s(100, 100), FONT_SIZE, r(10, 10), r(11, 11), false);
+        let to = resize.needs_resize(
+            &s(100, 100),
+            None,
+            FONT_SIZE,
+            Some(r(10, 10)),
+            r(11, 11),
+            false,
+        );
         assert_eq!(None, to);
     }
 
@@ -596,16 +673,44 @@ mod tests {
     fn needs_resize_crop() {
         let resize = Resize::Crop(None);
 
-        let to = resize.needs_resize(&s(100, 100), FONT_SIZE, r(10, 10), r(10, 10), false);
+        let to = resize.needs_resize(
+            &s(100, 100),
+            None,
+            FONT_SIZE,
+            Some(r(10, 10)),
+            r(10, 10),
+            false,
+        );
         assert_eq!(None, to);
 
-        let to = resize.needs_resize(&s(80, 100), FONT_SIZE, r(8, 10), r(10, 10), false);
+        let to = resize.needs_resize(
+            &s(80, 100),
+            None,
+            FONT_SIZE,
+            Some(r(8, 10)),
+            r(10, 10),
+            false,
+        );
         assert_eq!(None, to);
 
-        let to = resize.needs_resize(&s(100, 100), FONT_SIZE, r(10, 10), r(8, 10), false);
+        let to = resize.needs_resize(
+            &s(100, 100),
+            None,
+            FONT_SIZE,
+            Some(r(10, 10)),
+            r(8, 10),
+            false,
+        );
         assert_eq!(Some(r(8, 10)), to);
 
-        let to = resize.needs_resize(&s(100, 100), FONT_SIZE, r(10, 10), r(10, 8), false);
+        let to = resize.needs_resize(
+            &s(100, 100),
+            None,
+            FONT_SIZE,
+            Some(r(10, 10)),
+            r(10, 8),
+            false,
+        );
         assert_eq!(Some(r(10, 8)), to);
     }
 }

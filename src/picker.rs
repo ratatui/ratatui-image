@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    FontSize, ImageSource, Resize, Result,
+    FontSize, Resize, Result,
     errors::Errors,
     protocol::{
         Protocol, StatefulProtocol, StatefulProtocolType,
@@ -258,15 +258,15 @@ impl Picker {
         size: Size,
         resize: Resize,
     ) -> Result<Protocol> {
-        let source = ImageSource::new(image, self.font_size, self.background_color);
-
+        let desired =
+            Resize::round_pixel_size_to_cells(image.width(), image.height(), self.font_size);
         let (image, area) =
-            match resize.needs_resize(&source, self.font_size, source.desired, size, false) {
+            match resize.needs_resize(&image, Some(desired), self.font_size, None, size, false) {
                 Some(area) => {
-                    let image = resize.resize(&source, self.font_size, area, self.background_color);
+                    let image = resize.resize(&image, self.font_size, area, self.background_color);
                     (image, area)
                 }
-                None => (source.image, source.desired),
+                None => (image, desired),
             };
 
         self.new_protocol_raw(image, area)
@@ -274,7 +274,6 @@ impl Picker {
 
     /// Returns a new *stateful* protocol for [`crate::StatefulImage`] widgets.
     pub fn new_resize_protocol(&self, image: DynamicImage) -> StatefulProtocol {
-        let source = ImageSource::new(image, self.font_size, self.background_color);
         let protocol_type = match self.protocol_type {
             ProtocolType::Halfblocks => StatefulProtocolType::Halfblocks(Halfblocks::default()),
             ProtocolType::Sixel => StatefulProtocolType::Sixel(Sixel {
@@ -289,7 +288,7 @@ impl Picker {
                 ..Iterm2::default()
             }),
         };
-        StatefulProtocol::new(source, self.font_size, protocol_type)
+        StatefulProtocol::new(image, self.font_size, self.background_color, protocol_type)
     }
 }
 

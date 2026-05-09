@@ -136,10 +136,12 @@ impl StatefulProtocolType {
 
 impl StatefulProtocol {
     pub fn new(
-        source: ImageSource,
+        image: DynamicImage,
         font_size: FontSize,
+        background_color: Rgba<u8>,
         protocol_type: StatefulProtocolType,
     ) -> Self {
+        let source = ImageSource::new(image, font_size, background_color);
         Self {
             source,
             font_size,
@@ -151,7 +153,7 @@ impl StatefulProtocol {
 
     // Calculate the area that this image will ultimately render to, inside the given area.
     pub fn size_for(&self, resize: Resize, size: Size) -> Size {
-        resize.render_area(&self.source, self.font_size, size)
+        resize.render_area(&self.source.image, self.font_size, size)
     }
 
     pub fn protocol_type(&self) -> &StatefulProtocolType {
@@ -183,7 +185,12 @@ impl ResizeEncodeRender for StatefulProtocol {
             return;
         }
 
-        let img = resize.resize(&self.source, self.font_size, size, self.background_color());
+        let img = resize.resize(
+            &self.source.image,
+            self.font_size,
+            size,
+            self.background_color(),
+        );
 
         // TODO: save err in struct
         let result = self
@@ -204,14 +211,16 @@ impl ResizeEncodeRender for StatefulProtocol {
 
     fn needs_resize(&self, resize: &Resize, size: Size) -> Option<Size> {
         resize.needs_resize(
-            &self.source,
+            &self.source.image,
+            Some(self.source.desired),
             self.font_size,
-            self.last_encoding_area(),
+            Some(self.last_encoding_area()),
             size,
             self.source.hash != self.hash,
         )
     }
 }
+
 #[derive(Clone)]
 /// Image source for [crate::protocol::StatefulProtocol]s
 ///
@@ -228,7 +237,7 @@ impl ResizeEncodeRender for StatefulProtocol {
 /// assert_eq!((43, 14), (source.rect.width, source.rect.height));
 /// ```
 ///
-pub struct ImageSource {
+struct ImageSource {
     /// The original image without resizing.
     pub image: DynamicImage,
     /// The area that the [`ImageSource::image`] covers, but not necessarily fills.
@@ -246,8 +255,7 @@ impl ImageSource {
         font_size: FontSize,
         background_color: Rgba<u8>,
     ) -> ImageSource {
-        let desired =
-            ImageSource::round_pixel_size_to_cells(image.width(), image.height(), font_size);
+        let desired = Resize::round_pixel_size_to_cells(image.width(), image.height(), font_size);
 
         let mut state = DefaultHasher::new();
         image.as_bytes().hash(&mut state);
@@ -267,12 +275,6 @@ impl ImageSource {
             hash,
             background_color,
         }
-    }
-    /// Round an image pixel size to the nearest matching cell size, given a font size.
-    pub fn round_pixel_size_to_cells(img_width: u32, img_height: u32, font_size: FontSize) -> Size {
-        let width = (img_width as f32 / font_size.width as f32).ceil() as u16;
-        let height = (img_height as f32 / font_size.height as f32).ceil() as u16;
-        Size::new(width, height)
     }
 }
 
