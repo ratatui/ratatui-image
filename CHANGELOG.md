@@ -4,41 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [11.0.0-alpha.4](https://github.com/ratatui/ratatui-image/compare/v11.0.0-alpha.3...v11.0.0-alpha.4) - 2026-05-09
-
-### Fixed
-
-- fix SlicedProtocol::Sliced render
-
 ### Changed
-- `Image` does not render with clipping under Kitty or Halfblocks, to be consistent with Sixels and
-  ITerm2.
 
-### Added
-- `Image::alow_clipping(bool)` to allow clipping under Kitty and Halfblocks.
-
-## [11.0.0-alpha.3](https://github.com/ratatui/ratatui-image/compare/v11.0.0-alpha.2...v11.0.0-alpha.3) - 2026-05-05
-
-### Other
-
-- add Protocol::needs_placeholder
-- use ratatui::layout::Size instead of Rect where applicable
-
-### Added
-- SlicedImage and SlicedProtocol for partially rendering images (horizontal slices)
-- `Protocol::needs_placeholder` that returns a `Rect` for a placeholder if the image would not
-  render.
-
-### Removed
-- feature kitty-offset in favor of SlicedImage and SlicedProtocol
-
-### Changed
-- `FontSize = (u16, u16)` alias became `struct FontSize { width: u16, height: u16 }`
+- `FontSize = (u16, u16)` alias became `struct FontSize { width: u16, height: u16 }`.
 - Replaced `Rect` with `Size` everywhere it was used for size, or without positioning
   - `Picker::new_protocol()`
-  - `Resize::render_area()`
+  - `Resize::render_area()` became `Resize::size_for()`
   - `ProtocolTrait::area() -> Rect` became `ProtocolTrait::size() -> Size`
+  - `Protocol::area() -> Rect` became `Protocol::size() -> Size`
   - `StatefulProtocol::size_for()`
+  - `ThreadProtocol::size_for()`
   - `ResizeEncodeRender::resize_encode()`
   - `ResizeEncodeRender::needs_resize()`
   - `Halfblocks::new()`
@@ -48,7 +23,28 @@ All notable changes to this project will be documented in this file.
   - `ImageSource::round_pixel_size_to_cells()`
   - `chafa::encode()`
   - `primitive::encode()`
-  - Any places missed here should be trivial to fix
+  - Any other instances missed here should be trivial to fix.
+- `Image` does not render with clipping under Kitty or Halfblocks, to be consistent with Sixels and
+  ITerm2. See new `Image::allow_clipping` to keep existing default behavior.
+- `Resize::resize(&self, image: &DynamicImage, font_size: FontSize, size: Size, background_color: Rgba<u8>) -> DynamicImage`
+  resizes a `DynamicImage` to the size, either `Fit`, `Crop`, or `Scale`d.
+
+### Added
+
+- `Image::allow_clipping(bool)` to explicitly allow clipping under Kitty and Halfblocks.
+  Previously, Kitty and Halfblocks would automatically clip if the render area was too small, while
+  Sixels and ITerm2 can never clip.
+- `Resize::natural_size` calculates the "natural" size for an image with the font size.
+- `Protocol::needs_placeholder` returns the intersection of the image `Size` and the render `Area`,
+  to display some placeholder in that area.
+- `sliced` module with `SlicedImage` and `SlicedProtocol` for partially rendering images 
+  (horizontal slices).
+
+### Removed
+
+- `Resize::needs_resize`, confusing, internal detail.
+- `ImageSource`, confusing, more of an internal detail of `StatefulProtocol`, some functions 
+  required both this and `FontSize`.
 
 ## [10.0.8](https://github.com/ratatui/ratatui-image/compare/v10.0.7...v10.0.8) - 2026-04-30
 
