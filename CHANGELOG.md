@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.1](https://github.com/ratatui/ratatui-image/compare/v11.0.0...v11.0.1) - 2026-05-10
+
+### Fixed
+
+- fix SlicedProtocol::Sixel trailing empty bands
+- fix changelog
+
 ## [11.0.0](https://github.com/ratatui/ratatui-image/compare/v11.0.0...v10.0.8) - 2026-05-10
 
 ### Overview
