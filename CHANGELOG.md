@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.0](https://github.com/ratatui/ratatui-image/compare/v11.0.0-alpha.4...v11.0.0) - 2026-05-10
+
+### Other
+
+- release v11.0.0
+- move `DEFAULT_BACKGROUND_COLOR` into `Resize`.
+- update changelog
+
 ### Overview
 
 The terminal naturally has vertical scrolling. Many TUIs also follow vertical scrolling. Images
