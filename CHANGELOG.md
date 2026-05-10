@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.0](https://github.com/ratatui/ratatui-image/compare/v11.0.0...v10.0.8) - 2026-05-10
+
 ### Overview
 
 The terminal naturally has vertical scrolling. Many TUIs also follow vertical scrolling. Images
