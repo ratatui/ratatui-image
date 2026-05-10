@@ -167,9 +167,7 @@ impl SlicedProtocol {
         dyn_img: DynamicImage,
         size: Option<Size>,
     ) -> Result<SlicedProtocol, Errors> {
-        let size = size.unwrap_or_else(|| {
-            Resize::round_pixel_size_to_cells(dyn_img.width(), dyn_img.height(), picker.font_size())
-        });
+        let size = size.unwrap_or_else(|| Resize::natural_size(&dyn_img, picker.font_size()));
         match picker.protocol_type() {
             ProtocolType::Kitty => {
                 let Protocol::Kitty(kitty) =
@@ -309,6 +307,30 @@ mod sixel_slice {
             sixel::render(&data, area, buf);
         }
 
+        fn bands(&self, skip_line_count: usize, drop_line_count: usize) -> Vec<&str> {
+            let skip_bands = (skip_line_count * self.font_height as usize).div_ceil(6);
+
+            let bands: Vec<&str> = self.bands.to_vec();
+            let take_bands = (((self.size.height.saturating_sub(drop_line_count as u16))
+                * self.font_height)
+                / 6) as usize;
+
+            let sliced_bands: Vec<&str> = bands
+                .iter()
+                .skip(skip_bands)
+                .take(take_bands)
+                .copied()
+                .collect();
+
+            let trimmed = &sliced_bands[..sliced_bands
+                .iter()
+                .rposition(|s| !s.is_empty())
+                .map(|i| i + 1)
+                .unwrap_or(0)];
+
+            trimmed.into()
+        }
+
         pub fn to_sequence(
             &self,
             skip_line_count: usize,
@@ -318,23 +340,11 @@ mod sixel_slice {
         ) -> String {
             let (start, escape, end) = Parser::tmux_start_escape_end(self.is_tmux);
 
-            let skip_bands = (skip_line_count * self.font_height as usize).div_ceil(6);
-            let available = self.bands.len().saturating_sub(skip_bands);
-
-            let take_bands =
-                available.saturating_sub((drop_line_count * self.font_height as usize) / 6);
-
             let mut data = String::from(start);
             clear_area(&mut data, escape, width, height);
             data.push_str(self.header);
 
-            let sliced_bands: Vec<&str> = self
-                .bands
-                .iter()
-                .skip(skip_bands)
-                .take(take_bands)
-                .copied()
-                .collect();
+            let sliced_bands = self.bands(skip_line_count, drop_line_count);
 
             data.push_str(&sliced_bands.join("-"));
 
@@ -440,18 +450,17 @@ mod sixel_slice {
     mod tests {
         use ratatui::layout::Size;
 
-        use crate::{FontSize, Resize, protocol::sixel::Sixel, sliced::sixel_slice::SlicedSixel};
+        use crate::{
+            FontSize, Resize,
+            picker::{Picker, ProtocolType},
+            protocol::sixel::Sixel,
+            sliced::{SlicedProtocol, sixel_slice::SlicedSixel},
+        };
 
         #[test]
         fn test_sixel_slice_bands() {
-            // Simple data with bands separated by -
-            // The slice function strips preamble, so we need ESC P in the data
-            let esc = '\u{1b}';
-            let bs = '\\';
-            // Minimal sixel-like: ESC P q "attrs" header-bands-terminator ESC backslash
             // TODO: is there always a `-` before `<esc>\`?
-            let data = format!("{esc}[6X{esc}Pq\"1;1;8;16#0band1-band2-band3-{esc}{bs}");
-            // Skip 1 row, show 1 row, font height 6 means 1 band per row
+            let data = String::from("\x1b[6X\x1bPq\"1;1;8;16#0band1-band2-band3-\x1b\\");
             let sixel = Sixel {
                 data,
                 size: Size::default(),
@@ -476,13 +485,17 @@ mod sixel_slice {
                 let dyn_img = image::ImageReader::open(p).unwrap().decode().unwrap();
                 let dyn_img = Resize::Fit(None).resize(&dyn_img, font_size, size, None);
                 let sixel = Sixel::new(dyn_img, size, false).unwrap();
-                SlicedSixel::from_sixel(sixel, font_size.height, false)
+                (p, SlicedSixel::from_sixel(sixel, font_size.height, false))
             });
-            for sliced_sixel in sliced_sixels {
-                let source = &sliced_sixel.borrow_owner().data;
+            for (path, sliced_sixel) in sliced_sixels {
+                let mut source = sliced_sixel.borrow_owner().data.as_str();
+                source = source.strip_suffix("\x1b\\").unwrap();
+                source = source.trim_end_matches('-');
+                let source = format!("{source}-\x1b\\");
+
                 let sliced_sixel_data = sliced_sixel.borrow_dependent();
                 let sliced = sliced_sixel_data.to_sequence(0, 0, size.height, size.width);
-                if sliced != *source {
+                if sliced != source {
                     let mut surrounding = String::new();
                     for (i, char) in source.chars().enumerate() {
                         if surrounding.len() > 20 {
@@ -496,13 +509,43 @@ mod sixel_slice {
                         assert_eq!(
                             char,
                             sliced_char,
-                            "index #{i} (surrounding: {})",
+                            "{path} index #{i} (surrounding: \"{}\")",
                             surrounding.replace('\x1b', "<esc>")
                         );
                     }
                     panic!("should have found the first different char");
                 }
             }
+        }
+
+        #[test]
+        fn test_bands_from_image() {
+            let image = image::ImageReader::open("./assets/Ada.png")
+                .unwrap()
+                .decode()
+                .unwrap();
+
+            assert_eq!(225, image.height());
+
+            // Picker::halfblocks() font-height is hardcoded to 20.
+            let mut picker = Picker::halfblocks();
+            picker.set_protocol_type(ProtocolType::Sixel);
+
+            let SlicedProtocol::Sixel(proto) = SlicedProtocol::new(&picker, image, None).unwrap()
+            else {
+                panic!("expected SlicedProtocol::Sixel");
+            };
+            let sixel = proto.borrow_owner();
+
+            assert_eq!(12, sixel.size.height);
+
+            let sliced = proto.borrow_dependent();
+
+            // ceil(225 / 6) = 38, full image, no matter what font-size
+            assert_eq!(38, sliced.bands(0, 0).len());
+
+            // one row is 20px, so 3 bands make 18px
+            assert_eq!(3, sliced.bands(0, 11).len());
         }
     }
 }
