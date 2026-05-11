@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.2](https://github.com/ratatui/ratatui-image/compare/v11.0.1...v11.0.2) - 2026-05-11
+
+### Other
+
+- add option to query background color with OSC
+
 ## [11.0.1](https://github.com/ratatui/ratatui-image/compare/v11.0.0...v11.0.1) - 2026-05-10
 
 ### Fixed
