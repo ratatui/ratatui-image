@@ -119,10 +119,11 @@ impl Picker {
         let mut options_with_blacklist = options;
         let is_wezterm = env::var("WEZTERM_EXECUTABLE").is_ok_and(|s| !s.is_empty());
         let is_konsole = env::var("KONSOLE_VERSION").is_ok_and(|s| !s.is_empty());
-        if is_wezterm || is_konsole {
-            // WezTerm could use Sixel, but iTerm2 (detected later is better).
+        let is_iterm = env::var("TERM_PROGRAM").is_ok_and(|s| s.contains("iTerm"));
+        if is_wezterm || is_konsole || is_iterm {
+            // WezTerm could use Sixel, but iTerm2 (detected later) works better.
             // Konsole's Sixel implementation is buggy: https://github.com/ratatui/ratatui-image?tab=readme-ov-file#compatibility-matrix
-            // Neither implement the placeholder part of kitty correctly.
+            // None implements the placeholder part of kitty correctly.
             options_with_blacklist
                 .blacklist_protocols(vec![ProtocolType::Kitty, ProtocolType::Sixel]);
         }
