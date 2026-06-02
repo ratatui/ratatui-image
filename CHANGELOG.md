@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.3](https://github.com/ratatui/ratatui-image/compare/v11.0.2...v11.0.3) - 2026-06-02
+
+### Other
+
+- add SlicedProtocol::new_with_resize
+
 ## [11.0.2](https://github.com/ratatui/ratatui-image/compare/v11.0.1...v11.0.2) - 2026-05-11
 
 ### Other
