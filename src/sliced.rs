@@ -168,18 +168,26 @@ impl SlicedProtocol {
         size: Option<Size>,
     ) -> Result<SlicedProtocol, Errors> {
         let size = size.unwrap_or_else(|| Resize::natural_size(&dyn_img, picker.font_size()));
+        SlicedProtocol::new_with_resize(picker, dyn_img, size, Resize::Fit(None))
+    }
+
+    /// Create a `SlicedProtocol` for the target [`ratatui::layout::Size`] with the given
+    /// [`Resize`] option.
+    pub fn new_with_resize(
+        picker: &Picker,
+        dyn_img: DynamicImage,
+        size: Size,
+        resize: Resize,
+    ) -> Result<SlicedProtocol, Errors> {
         match picker.protocol_type() {
             ProtocolType::Kitty => {
-                let Protocol::Kitty(kitty) =
-                    picker.new_protocol(dyn_img, size, Resize::Fit(None))?
-                else {
+                let Protocol::Kitty(kitty) = picker.new_protocol(dyn_img, size, resize)? else {
                     unreachable!("ProtocolType::Kitty must produce Protocol::Kitty");
                 };
                 Ok(SlicedProtocol::Kitty(kitty))
             }
             ProtocolType::Sixel => {
                 let font_size = picker.font_size();
-                let resize = Resize::Fit(None);
 
                 let dyn_img = resize.resize(&dyn_img, font_size, size, None);
 
@@ -191,7 +199,7 @@ impl SlicedProtocol {
             }
             ProtocolType::Halfblocks => {
                 let Protocol::Halfblocks(halfblocks) =
-                    picker.new_protocol(dyn_img, size, Resize::Fit(None))?
+                    picker.new_protocol(dyn_img, size, resize)?
                 else {
                     unreachable!("ProtocolType::Halfblocks must produce Protocol::Halfblocks");
                 };
