@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.4](https://github.com/ratatui/ratatui-image/compare/v11.0.3...v11.0.4) - 2026-06-05
+
+### Fixed
+
+- *(sixel, iterm2)* use CellDiffOption::ForcedWidth(1) for escape sequence cell
+
+### Changed
+
+- update ratatui requirement to ^0.30.1
+
 ## [11.0.3](https://github.com/ratatui/ratatui-image/compare/v11.0.2...v11.0.3) - 2026-06-02
 
 ### Other
