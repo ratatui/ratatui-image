@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.5](https://github.com/ratatui/ratatui-image/compare/v11.0.4...v11.0.5) - 2026-06-20
+
+### Other
+
+- move type casts from u16 to usize to be before multiplication
+
 ## [11.0.4](https://github.com/ratatui/ratatui-image/compare/v11.0.3...v11.0.4) - 2026-06-05
 
 ### Fixed
