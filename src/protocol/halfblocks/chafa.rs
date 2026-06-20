@@ -97,7 +97,7 @@ pub fn encode(img: &DynamicImage, size: Size) -> Option<Vec<HalfBlock>> {
             (w * 3) as i32,
         );
 
-        let mut blocks = Vec::with_capacity((width * height) as usize);
+        let mut blocks = Vec::with_capacity(width as usize * height as usize);
 
         for y in 0..height {
             for x in 0..width {
