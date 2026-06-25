@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.6](https://github.com/ratatui/ratatui-image/compare/v11.0.5...v11.0.6) - 2026-06-25
+
+### Other
+
+- only filter out '\0'
+- add check for ascii control characters returned by `chafa_canvas_get_char_at()`
+
 ## [11.0.5](https://github.com/ratatui/ratatui-image/compare/v11.0.4...v11.0.5) - 2026-06-20
 
 ### Other
