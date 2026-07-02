@@ -76,9 +76,9 @@ Sixel image rendered on the last line of terminal causes a scroll | [#57](https:
   work for TUI programs.
   The terminal protocol guessing code has been adapted to rustix, thus the author of viuer is
   included in the copyright notice.
-* [yazi](https://github.com/sxyazi/yazi)
-  Not a library but a terminal file manager that implementes many graphics protocols and lets you
-  preview images in the filesystem.
+* [yazi-adapter](https://github.com/sxyazi/yazi/tree/main/yazi-adapter)
+  A library part of [yazi](https://github.com/sxyazi/yazi) the terminal file manager that
+  implements many graphics protocols and lets you preview image files.
 * [Überzug++](https://github.com/jstkdng/ueberzugpp)
   CLI utility that draws images on terminals by using X11/wayland child windows, sixels, kitty,
   and/or iterm2 protocols (any means necessary). There exists several wrapper or bindings crates.
