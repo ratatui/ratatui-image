@@ -107,17 +107,6 @@ impl Picker {
         // Detect tmux, and only if positive then take some risky guess for iTerm2 support.
         let (is_tmux, tmux_proto) = detect_tmux_and_outer_protocol_from_env();
 
-        static DEFAULT_PICKER: Picker = Picker {
-            // This is completely arbitrary. For halfblocks, it doesn't have to be precise
-            // since we're not rendering pixels. It should be roughly 1:2 ratio, and some
-            // reasonable size.
-            font_size: FontSize::new(10, 20),
-            background_color: None,
-            protocol_type: ProtocolType::Halfblocks,
-            is_tmux: false,
-            capabilities: Vec::new(),
-        };
-
         let mut options_with_blacklist = options;
         let is_wezterm = env::var("WEZTERM_EXECUTABLE").is_ok_and(|s| !s.is_empty());
         let is_konsole = env::var("KONSOLE_VERSION").is_ok_and(|s| !s.is_empty());
@@ -155,10 +144,16 @@ impl Picker {
                     Ok(p)
                 }
             }
+            // The terminal did not answer the query, but it may still be possible to figure out
+            // the font-size with an ioctl, and env vars may still hint at iTerm2 support. This
+            // happens for example on Windows ConPTY, which does not reliably deliver the
+            // responses to the child process.
             Err(Errors::NoCap | Errors::NoStdinResponse | Errors::NoFontSize) => {
-                let mut p = DEFAULT_PICKER.clone();
-                p.is_tmux = is_tmux;
-                Ok(p)
+                Ok(fallback_picker(
+                    is_tmux,
+                    tmux_proto.or_else(iterm2_from_env),
+                    font_size_fallback(),
+                ))
             }
             Err(err) => Err(err),
         }
@@ -291,6 +286,35 @@ impl Picker {
         };
         StatefulProtocol::new(image, self.font_size, self.background_color, protocol_type)
     }
+}
+
+static DEFAULT_PICKER: Picker = Picker {
+    // This is completely arbitrary. For halfblocks, it doesn't have to be precise
+    // since we're not rendering pixels. It should be roughly 1:2 ratio, and some
+    // reasonable size.
+    font_size: FontSize::new(10, 20),
+    background_color: None,
+    protocol_type: ProtocolType::Halfblocks,
+    is_tmux: false,
+    capabilities: Vec::new(),
+};
+
+/// Build a picker from whatever could be detected without the terminal answering the query.
+///
+/// A protocol other than halfblocks can only render meaningfully with an actual font-size, so
+/// without one the `protocol_type` hint is discarded, just like on the query's success path.
+fn fallback_picker(
+    is_tmux: bool,
+    protocol_type: Option<ProtocolType>,
+    font_size: Option<FontSize>,
+) -> Picker {
+    let mut picker = DEFAULT_PICKER.clone();
+    picker.is_tmux = is_tmux;
+    if let Some(font_size) = font_size {
+        picker.font_size = font_size;
+        picker.protocol_type = protocol_type.unwrap_or(ProtocolType::Halfblocks);
+    }
+    picker
 }
 
 fn detect_tmux_and_outer_protocol_from_env() -> (bool, Option<ProtocolType>) {
@@ -601,9 +625,12 @@ fn query_with_timeout(
 mod tests {
     use std::assert_eq;
 
-    use crate::picker::{Capability, Picker, ProtocolType};
+    use crate::{
+        FontSize,
+        picker::{Capability, Picker, ProtocolType},
+    };
 
-    use super::{cap_parser::Response, interpret_parser_responses};
+    use super::{cap_parser::Response, fallback_picker, interpret_parser_responses};
 
     #[test]
     fn test_cycle_protocol() {
@@ -621,6 +648,30 @@ mod tests {
     #[test]
     fn test_from_query_stdio_no_hang() {
         let _ = Picker::from_query_stdio();
+    }
+
+    #[test]
+    fn test_fallback_picker() {
+        // The terminal did not answer, but the font-size is known from the ioctl fallback and
+        // some env var hinted at iTerm2 support: use it instead of halfblocks.
+        let picker = fallback_picker(
+            false,
+            Some(ProtocolType::Iterm2),
+            Some(FontSize::new(8, 16)),
+        );
+        assert_eq!(picker.protocol_type(), ProtocolType::Iterm2);
+        assert_eq!(
+            (picker.font_size().width, picker.font_size().height),
+            (8, 16)
+        );
+
+        // Without a font-size, no other protocol can be rendered meaningfully.
+        let picker = fallback_picker(false, Some(ProtocolType::Iterm2), None);
+        assert_eq!(picker.protocol_type(), ProtocolType::Halfblocks);
+
+        // Without a hint, stay on halfblocks.
+        let picker = fallback_picker(false, None, Some(FontSize::new(8, 16)));
+        assert_eq!(picker.protocol_type(), ProtocolType::Halfblocks);
     }
 
     #[test]
