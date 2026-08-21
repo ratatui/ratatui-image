@@ -244,8 +244,8 @@ impl SlicedProtocol {
 /// So this only is used for Iterm2.
 fn slice_rows(image: DynamicImage, font_size: FontSize, size: Size) -> (Vec<DynamicImage>, Size) {
     let image = image.resize(
-        (size.width * font_size.width).into(),
-        (size.height * font_size.height).into(),
+        u32::from(size.width) * u32::from(font_size.width),
+        u32::from(size.height) * u32::from(font_size.height),
         image::imageops::FilterType::Nearest,
     );
 

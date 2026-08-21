@@ -13,7 +13,7 @@ const SPACE: char = ' ';
 pub fn encode(img: &DynamicImage, size: Size) -> Vec<HalfBlock> {
     let img = img.resize_exact(
         size.width as u32,
-        (size.height * 2) as u32,
+        u32::from(size.height) * 2,
         FilterType::Triangle,
     );
 
@@ -23,7 +23,7 @@ pub fn encode(img: &DynamicImage, size: Size) -> Vec<HalfBlock> {
             lower: Color::Rgb(0, 0, 0),
             char: HALF_UPPER,
         };
-        (size.width * size.height) as usize
+        usize::from(size.width) * usize::from(size.height)
     ];
 
     for (y, row) in img.to_rgb8().rows().enumerate() {
@@ -120,5 +120,41 @@ impl HalfBlock {
                 (gray, gray, gray)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageBuffer, Rgba};
+
+    /// A composite larger than `u16::MAX` cells must still encode.
+    ///
+    /// The buffer was allocated with `(size.width * size.height) as usize` — a
+    /// `u16` multiply, which wraps — while the write index was computed as
+    /// `x + (size.width as usize) * (y / 2)`, in `usize`, which does not. Below
+    /// the ceiling the two agree exactly; one cell past it the allocation is made
+    /// modulo 65536 while the loop still walks the true extent.
+    ///
+    /// Reported from a 458x144 pane (65952 cells): the allocation wrapped to 416
+    /// and the encoder panicked with "index out of bounds: the len is 416 but the
+    /// index is 416".
+    #[test]
+    fn encodes_a_grid_of_more_than_u16_max_cells() {
+        let img: DynamicImage =
+            ImageBuffer::from_pixel(64, 64, Rgba::<u8>([255, 0, 0, 255])).into();
+        let size = Size::new(458, 144);
+        assert!(
+            u32::from(size.width) * u32::from(size.height) > u32::from(u16::MAX),
+            "the case is only meaningful past the ceiling",
+        );
+
+        let data = encode(&img, size);
+
+        assert_eq!(
+            data.len(),
+            458 * 144,
+            "one entry per cell, not modulo 65536"
+        );
     }
 }
