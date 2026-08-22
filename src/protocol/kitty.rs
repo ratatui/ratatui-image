@@ -5,6 +5,7 @@
 //!
 //! [unicode-placeholders]: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
 //! [kitty protocol]: https://sw.kovidgoyal.net/kitty/graphics-protocol
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,8 +27,8 @@ struct KittyProtoState {
 }
 
 impl KittyProtoState {
-    fn new(img: &DynamicImage, id: u32, is_tmux: bool) -> Self {
-        let transmit_str = transmit_virtual(img, id, is_tmux);
+    fn new(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool) -> Self {
+        let transmit_str = transmit_virtual(img, id, is_tmux, compress);
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         let id_color = format!("\x1b[38;2;{id_r};{id_g};{id_b}m");
         let id_extra = u16::from(id_extra);
@@ -57,8 +58,14 @@ pub struct Kitty {
 }
 
 impl Kitty {
-    pub fn new(image: DynamicImage, size: Size, id: u32, is_tmux: bool) -> Result<Self> {
-        let proto_state = KittyProtoState::new(&image, id, is_tmux);
+    pub fn new(
+        image: DynamicImage,
+        size: Size,
+        id: u32,
+        is_tmux: bool,
+        compress: bool,
+    ) -> Result<Self> {
+        let proto_state = KittyProtoState::new(&image, id, is_tmux, compress);
         Ok(Self { proto_state, size })
     }
 
@@ -97,10 +104,11 @@ pub struct StatefulKitty {
     size: Size,
     proto_state: KittyProtoState,
     is_tmux: bool,
+    compress: bool,
 }
 
 impl StatefulKitty {
-    pub fn new(id: u32, is_tmux: bool) -> StatefulKitty {
+    pub fn new(id: u32, is_tmux: bool, compress: bool) -> StatefulKitty {
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         let id_color = format!("\x1b[38;2;{id_r};{id_g};{id_b}m");
         let id_extra = u16::from(id_extra);
@@ -109,6 +117,7 @@ impl StatefulKitty {
             size: Size::default(),
             proto_state: KittyProtoState::default(),
             is_tmux,
+            compress,
         }
     }
 }
@@ -130,7 +139,7 @@ impl StatefulProtocolTrait for StatefulKitty {
     fn resize_encode(&mut self, img: DynamicImage, size: Size) -> Result<()> {
         self.size = size;
         // If resized then we must transmit again.
-        self.proto_state = KittyProtoState::new(&img, self.id.0, self.is_tmux);
+        self.proto_state = KittyProtoState::new(&img, self.id.0, self.is_tmux, self.compress);
         Ok(())
     }
 }
@@ -215,16 +224,50 @@ fn render(
     }
 }
 
+/// Deflate `raw` into the RFC 1950 zlib stream the kitty protocol's `o=z` means.
+///
+/// Level 1: on photographic content it encodes about 3x faster than the
+/// default level 6 for about 7% more bytes; on flat 16-colour art it's also
+/// about 3x faster but produces roughly TWICE the bytes level 6 would (e.g.
+/// 43 KB vs 103 KB base64 for a 720x570 frame) — still 20x+ smaller than the
+/// raw 2.2 MB. The encode runs synchronously in `new_protocol`, so encode
+/// time, not wire size, is the cost that matters here.
+fn zlib(raw: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    // Writing into a `Vec` cannot fail, and neither can finishing one.
+    enc.write_all(raw).expect("zlib encoder writing into a Vec");
+    enc.finish().expect("zlib encoder writing into a Vec")
+}
+
 /// Create a kitty escape sequence for transmitting and virtual-placement.
 ///
 /// The image will be transmitted as RGBA in chunks of 4096 bytes.
 /// A "virtual placement" (U=1) is created so that we can place it using unicode placeholders.
 /// Removing the placements when the unicode placeholder is no longer there is being handled
 /// automatically by kitty.
-fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool) -> String {
+///
+/// With `compress`, the payload is deflated and the transmission says `o=z`.
+/// That is the payload's ENCODING and nothing else: compression happens before
+/// base64, `f=32` still names the format the terminal finds after inflating, and
+/// `s`/`v` still name the uncompressed image's pixel dimensions, because the
+/// terminal sizes its buffer from them. Only chunk boundaries move, since it is
+/// the compressed stream that gets chunked. `S` is for PNG-plus-compression and
+/// has no place here.
+///
+/// `compress` must only be set when the terminal answered the `o=z` capability
+/// probe: a terminal that cannot inflate refuses the transmission outright, and
+/// every placement naming the image then draws nothing at all.
+fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool) -> String {
     let (w, h) = (img.width(), img.height());
     let img_rgba8 = img.to_rgba8();
-    let bytes = img_rgba8.as_raw();
+    let raw = img_rgba8.as_raw();
+    let bytes: Cow<[u8]> = if compress {
+        Cow::Owned(zlib(raw))
+    } else {
+        Cow::Borrowed(raw)
+    };
+    let compression = if compress { "o=z," } else { "" };
 
     let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
 
@@ -236,7 +279,7 @@ fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool) -> String {
 
     // rough estimation for the worst-case size of what'll be written into `data` in the following
     // loop
-    const WORST_CASE_ADDITIONAL_CHUNK_0_LEN: usize = 46;
+    const WORST_CASE_ADDITIONAL_CHUNK_0_LEN: usize = 50;
     let bytes_written_per_chunk = 11 + CHARS_PER_CHUNK + (escape.len() * 2);
     let reserve_size =
         (chunk_count * bytes_written_per_chunk) + WORST_CASE_ADDITIONAL_CHUNK_0_LEN + end.len();
@@ -251,7 +294,7 @@ fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool) -> String {
         write!(data, "{escape}_Gq=2,").unwrap();
 
         if i == 0 {
-            write!(data, "i={id},a=T,U=1,f=32,t=d,s={w},v={h},").unwrap();
+            write!(data, "i={id},a=T,U=1,f=32,{compression}t=d,s={w},v={h},").unwrap();
         }
 
         // m=0 means over
@@ -574,4 +617,101 @@ fn diacritic(y: u16) -> char {
     *DIACRITICS
         .get(usize::from(y))
         .unwrap_or_else(|| &DIACRITICS[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transmit_virtual;
+    use image::{DynamicImage, RgbaImage};
+
+    fn canvas() -> DynamicImage {
+        // Flat bands: artwork, not noise, which is what deflate is for and what
+        // every one of these transmissions actually carries.
+        let mut img = RgbaImage::new(64, 32);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgba([(x / 8 * 32) as u8, 0x40, 0x80, 0xff]);
+        }
+        DynamicImage::ImageRgba8(img)
+    }
+
+    /// Split a transmission into its first command's parameters and every
+    /// chunk's payload concatenated, the way a terminal reassembles it.
+    fn reassemble(seq: &str) -> (String, Vec<u8>) {
+        let mut params = String::new();
+        let mut payload = String::new();
+        for (i, cmd) in seq.split("\x1b_G").skip(1).enumerate() {
+            let cmd = cmd
+                .strip_suffix("\x1b\\")
+                .expect("each command ends with ST");
+            let (p, data) = cmd.split_once(';').expect("each chunk has a payload");
+            if i == 0 {
+                params = p.to_string();
+            } else {
+                assert!(
+                    p.split(',')
+                        .all(|kv| kv.starts_with("m=") || kv.starts_with("q=")),
+                    "a continuation chunk may carry only m and q, got `{p}`"
+                );
+            }
+            payload.push_str(data);
+        }
+        let bytes = base64_simd::STANDARD
+            .decode_to_vec(payload)
+            .expect("the payload is base64");
+        (params, bytes)
+    }
+
+    #[test]
+    fn transmit_without_compression_is_the_raw_image() {
+        let img = canvas();
+        let (params, bytes) = reassemble(&transmit_virtual(&img, 7, false, false));
+        assert!(
+            !params.contains("o=z"),
+            "nothing claims to be compressed: {params}"
+        );
+        assert!(
+            params.contains("f=32") && params.contains("s=64,v=32"),
+            "{params}"
+        );
+        assert_eq!(bytes, *img.to_rgba8().as_raw());
+    }
+
+    /// `o=z` is the payload's ENCODING: `f` still names the format the terminal
+    /// finds after inflating, and `s`/`v` still name the uncompressed image,
+    /// because that is what the terminal sizes its buffer from. A transmission
+    /// that compressed each chunk separately, or that put the compressed length
+    /// in `s`/`v`, would contain `o=z` just the same and draw nothing.
+    #[test]
+    fn transmit_with_compression_inflates_back_to_the_raw_image() {
+        let img = canvas();
+        let (params, bytes) = reassemble(&transmit_virtual(&img, 7, false, true));
+        assert!(
+            params.contains("o=z"),
+            "the payload is compressed and says so: {params}"
+        );
+        assert!(
+            params.contains("f=32"),
+            "`o=z` is the encoding, `f` is the format: {params}"
+        );
+        assert!(
+            params.contains("s=64,v=32"),
+            "the UNCOMPRESSED dimensions: {params}"
+        );
+        assert!(
+            !params.contains("S="),
+            "`S` is for PNG-plus-compression, and this is f=32"
+        );
+
+        let raw = img.to_rgba8();
+        assert!(
+            bytes.len() < raw.as_raw().len(),
+            "{} vs {}",
+            bytes.len(),
+            raw.as_raw().len()
+        );
+        let mut out = Vec::new();
+        std::io::copy(&mut flate2::read::ZlibDecoder::new(&bytes[..]), &mut out)
+            .expect("the whole payload is one zlib stream");
+        assert_eq!(out, *raw.as_raw());
+    }
 }

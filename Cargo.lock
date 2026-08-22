@@ -2050,6 +2050,7 @@ dependencies = [
  "color-eyre",
  "criterion",
  "crossterm",
+ "flate2",
  "futures",
  "icy_sixel",
  "image",
