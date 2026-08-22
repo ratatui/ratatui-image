@@ -189,7 +189,7 @@ jobs:
             echo "" >> comment_body.txt
           fi
 
-          echo "Screenshots from all terminal emulators:" >> comment_body.txt
+          echo "<details><summary>Screenshots from all terminal emulators:</summary>" >> comment_body.txt
           echo "" >> comment_body.txt
 
           for terminal in $terminal_list; do
@@ -208,6 +208,8 @@ jobs:
               echo "" >> comment_body.txt
             fi
           done
+
+          echo "</details>" >> comment_body.txt
 
       - name: Comment on PR with all screenshots
         uses: marocchino/sticky-pull-request-comment@v2
