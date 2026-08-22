@@ -229,6 +229,19 @@ impl Picker {
         self.font_size
     }
 
+    /// Set the [FontSize], for when the terminal's cell size changed.
+    ///
+    /// A cell changes size whenever the user changes the font or its size
+    /// mid-session, and nothing else the picker holds changes with it: the
+    /// protocol, the detected [Capability] list, the tmux flag and the
+    /// background color all still describe the same terminal. Re-querying with
+    /// [Picker::from_query_stdio] would redetect them at the cost of writing to
+    /// and reading from stdio, which an application that already owns the
+    /// keyboard cannot safely do; this updates only the part that moved.
+    pub fn set_font_size(&mut self, font_size: FontSize) {
+        self.font_size = font_size;
+    }
+
     /// Change the default background color (transparent black).
     pub fn set_background_color<T: Into<Rgba<u8>>>(&mut self, background_color: Option<T>) {
         self.background_color = background_color.map(Into::into);
@@ -656,6 +669,28 @@ mod tests {
         assert_eq!(proto, ProtocolType::Iterm2);
         proto = proto.next();
         assert_eq!(proto, ProtocolType::Halfblocks);
+    }
+
+    #[test]
+    fn test_set_font_size_keeps_the_rest_of_the_picker() {
+        let mut picker = Picker {
+            font_size: FontSize::new(10, 20),
+            protocol_type: ProtocolType::Kitty,
+            background_color: None,
+            is_tmux: true,
+            capabilities: vec![Capability::Kitty, Capability::KittyCompression],
+        };
+
+        picker.set_font_size(FontSize::new(7, 15));
+
+        assert_eq!(7, picker.font_size().width);
+        assert_eq!(15, picker.font_size().height);
+        assert_eq!(ProtocolType::Kitty, picker.protocol_type());
+        assert_eq!(
+            &vec![Capability::Kitty, Capability::KittyCompression],
+            picker.capabilities()
+        );
+        assert!(picker.is_tmux);
     }
 
     #[test]
