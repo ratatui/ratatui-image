@@ -54,7 +54,7 @@ pub struct Picker {
 }
 
 /// Serde-friendly protocol-type enum for [Picker].
-#[derive(PartialEq, Clone, Debug, Copy)]
+#[derive(PartialEq, Eq, Clone, Debug, Copy)]
 #[cfg_attr(
     feature = "serde",
     derive(Deserialize, Serialize),
