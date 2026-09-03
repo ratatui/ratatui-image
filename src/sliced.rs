@@ -296,7 +296,9 @@ mod sixel_slice {
         size: Size,
         font_height: u16,
         is_tmux: bool,
-        header: &'a str,
+        dcs_prefix: &'a str,
+        decgra_prefix: Option<&'a str>,
+        color_defs: &'a str,
         bands: Vec<&'a str>,
     }
     impl<'a> SlicedSixelData<'a> {
@@ -350,9 +352,16 @@ mod sixel_slice {
 
             let mut data = String::from(start);
             clear_area(&mut data, escape, width, height);
-            data.push_str(self.header);
+            data.push_str(self.dcs_prefix);
 
             let sliced_bands = self.bands(skip_line_count, drop_line_count);
+
+            if let Some(prefix) = self.decgra_prefix {
+                let pv = sliced_bands.len() * 6;
+                data.push_str(prefix);
+                data.push_str(&pv.to_string());
+            }
+            data.push_str(self.color_defs);
 
             data.push_str(&sliced_bands.join("-"));
 
@@ -375,17 +384,62 @@ mod sixel_slice {
                 let data = &s.data[dcs_start..];
                 let header_end = find_sixel_data_start(data);
                 let (header, body) = data.split_at(header_end);
+                let (dcs_prefix, decgra_prefix, color_defs) = parse_decgra(header);
                 let mut bands: Vec<&str> = body.split('-').collect();
                 bands.pop();
                 SlicedSixelData {
                     size,
                     font_height,
                     is_tmux,
-                    header,
+                    dcs_prefix,
+                    decgra_prefix,
+                    color_defs,
                     bands,
                 }
             })
         }
+    }
+
+    /// Splits a sixel header (from DCS intro through colour definitions) into three parts:
+    /// - `dcs_prefix`: everything up to but not including the DECGRA `"`
+    /// - `decgra_prefix`: the DECGRA up to but not including the Pv field, e.g. `"1;1;100;`
+    /// - `color_defs`: everything after the Pv digits (the palette entries)
+    ///
+    /// Returns `(header, None, "")` when no DECGRA is present.
+    fn parse_decgra(header: &str) -> (&str, Option<&str>, &str) {
+        let Some(quote_pos) = header.find('"') else {
+            return (header, None, "");
+        };
+
+        // Count three semicolons inside the DECGRA to locate where Pv begins.
+        let after_quote = &header[quote_pos + 1..];
+        let mut semicolons = 0usize;
+        let mut pv_offset = None;
+        for (i, c) in after_quote.char_indices() {
+            if c == ';' {
+                semicolons += 1;
+                if semicolons == 3 {
+                    pv_offset = Some(i + 1);
+                    break;
+                }
+            }
+        }
+
+        let Some(pv_offset) = pv_offset else {
+            return (header, None, "");
+        };
+
+        let pv_start = quote_pos + 1 + pv_offset;
+        let pv_len = header[pv_start..]
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(header.len() - pv_start);
+        let pv_end = pv_start + pv_len;
+
+        (
+            &header[..quote_pos],
+            Some(&header[quote_pos..pv_start]),
+            &header[pv_end..],
+        )
     }
 
     fn find_sixel_data_start(data: &str) -> usize {
