@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.7](https://github.com/ratatui/ratatui-image/compare/v11.0.6...v11.0.7) - 2026-09-03
+
+### Other
+
+- SlicedProtocol replaces DECGRA raster size accounting for the used bands
+- Derive `Eq` for `ProtocolType`
+- collapse screenshot list in PR comment
+- use ioctl font-size and env hints when the capability query gets no response
+- mention yazi-adapter rather than yazi
+
 ## [11.0.6](https://github.com/ratatui/ratatui-image/compare/v11.0.5...v11.0.6) - 2026-06-25
 
 ### Other
