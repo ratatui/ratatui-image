@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.0.8](https://github.com/ratatui/ratatui-image/compare/v11.0.7...v11.0.8) - 2026-09-04
+
+### Other
+
+- sliced sixel also uses round_pixel_size_to_cells
+
 ## [11.0.7](https://github.com/ratatui/ratatui-image/compare/v11.0.6...v11.0.7) - 2026-09-03
 
 ### Other

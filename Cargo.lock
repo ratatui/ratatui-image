@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "ratatui-image"
-version = "11.0.7"
+version = "11.0.8"
 dependencies = [
  "base64-simd",
  "color-eyre",
