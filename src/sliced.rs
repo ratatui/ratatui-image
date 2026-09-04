@@ -189,9 +189,10 @@ impl SlicedProtocol {
             ProtocolType::Sixel => {
                 let font_size = picker.font_size();
 
-                let dyn_img = resize.resize(&dyn_img, font_size, size, None);
+                let actual_size = resize.size_for(&dyn_img, font_size, size);
+                let dyn_img = resize.resize(&dyn_img, font_size, actual_size, None);
 
-                let sixel = Sixel::new(dyn_img, size, picker.is_tmux)?;
+                let sixel = Sixel::new(dyn_img, actual_size, picker.is_tmux)?;
 
                 let sliced = SlicedSixel::from_sixel(sixel, font_size.height, picker.is_tmux);
 
@@ -321,9 +322,9 @@ mod sixel_slice {
             let skip_bands = (skip_line_count * self.font_height as usize).div_ceil(6);
 
             let bands: Vec<&str> = self.bands.to_vec();
-            let take_bands = (((self.size.height.saturating_sub(drop_line_count as u16))
-                * self.font_height)
-                / 6) as usize;
+            let take_bands = ((self.size.height.saturating_sub(drop_line_count as u16)) as usize
+                * self.font_height as usize)
+                .div_ceil(6);
 
             let sliced_bands: Vec<&str> = bands
                 .iter()
@@ -606,8 +607,8 @@ mod sixel_slice {
             // ceil(225 / 6) = 38, full image, no matter what font-size
             assert_eq!(38, sliced.bands(0, 0).len());
 
-            // one row is 20px, so 3 bands make 18px
-            assert_eq!(3, sliced.bands(0, 11).len());
+            // one row is 20px, ceil(20/6) = 4 bands
+            assert_eq!(4, sliced.bands(0, 11).len());
         }
     }
 }
