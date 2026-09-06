@@ -93,6 +93,7 @@ impl App {
             // demo.
             terminal_background_color_osc: true,
             text_sizing_protocol: true,
+            kitty_shared_memory_object: Some(std::process::id()),
             ..Default::default()
         })
         .unwrap();
