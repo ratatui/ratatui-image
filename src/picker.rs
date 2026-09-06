@@ -60,6 +60,7 @@ pub struct Picker {
     background_color: Option<Rgba<u8>>,
     pub(crate) is_tmux: bool,
     capabilities: Vec<Capability>,
+    kitty_shm: Option<u32>,
 }
 
 /// Serde-friendly protocol-type enum for [Picker].
@@ -116,6 +117,7 @@ impl Picker {
         // Detect tmux, and only if positive then take some risky guess for iTerm2 support.
         let (is_tmux, tmux_proto) = detect_tmux_and_outer_protocol_from_env();
 
+        let kitty_shm = options.kitty_shared_memory_object;
         let mut options_with_blacklist = options;
         let is_wezterm = env::var("WEZTERM_EXECUTABLE").is_ok_and(|s| !s.is_empty());
         let is_konsole = env::var("KONSOLE_VERSION").is_ok_and(|s| !s.is_empty());
@@ -146,10 +148,12 @@ impl Picker {
                         protocol_type,
                         is_tmux,
                         capabilities: caps,
+                        kitty_shm,
                     })
                 } else {
                     let mut p = DEFAULT_PICKER.clone();
                     p.is_tmux = is_tmux;
+                    p.kitty_shm = kitty_shm;
                     Ok(p)
                 }
             }
@@ -158,11 +162,13 @@ impl Picker {
             // happens for example on Windows ConPTY, which does not reliably deliver the
             // responses to the child process.
             Err(Errors::NoCap | Errors::NoStdinResponse | Errors::NoFontSize) => {
-                Ok(fallback_picker(
+                let mut p = fallback_picker(
                     is_tmux,
                     tmux_proto.or_else(iterm2_from_env),
                     font_size_fallback(),
-                ))
+                );
+                p.kitty_shm = kitty_shm;
+                Ok(p)
             }
             Err(err) => Err(err),
         }
@@ -186,6 +192,7 @@ impl Picker {
             protocol_type: ProtocolType::Halfblocks,
             is_tmux,
             capabilities: Vec::new(),
+            kitty_shm: None,
         }
     }
 
@@ -211,6 +218,7 @@ impl Picker {
             protocol_type,
             is_tmux,
             capabilities: Vec::new(),
+            kitty_shm: None,
         }
     }
 
@@ -252,6 +260,7 @@ impl Picker {
                 rand::random(),
                 self.is_tmux,
                 self.capabilities.contains(&Capability::KittyCompression),
+                self.kitty_shm,
             )?)),
             ProtocolType::Iterm2 => Ok(Protocol::ITerm2(Iterm2::new(image, size, self.is_tmux)?)),
         }
@@ -290,6 +299,7 @@ impl Picker {
                 random(),
                 self.is_tmux,
                 self.capabilities.contains(&Capability::KittyCompression),
+                self.kitty_shm,
             )),
             ProtocolType::Iterm2 => StatefulProtocolType::ITerm2(Iterm2 {
                 is_tmux: self.is_tmux,
@@ -309,6 +319,7 @@ static DEFAULT_PICKER: Picker = Picker {
     protocol_type: ProtocolType::Halfblocks,
     is_tmux: false,
     capabilities: Vec::new(),
+    kitty_shm: None,
 };
 
 /// Build a picker from whatever could be detected without the terminal answering the query.
