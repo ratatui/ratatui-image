@@ -10,6 +10,13 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(windows))]
+use rustix::{
+    fs::Mode,
+    io::write as rustix_write,
+    shm::{self, OFlags as ShmOFlags},
+};
+
 use crate::protocol::UNIT_WIDTH;
 use crate::{Result, picker::cap_parser::Parser};
 use image::DynamicImage;
@@ -27,16 +34,22 @@ struct KittyProtoState {
 }
 
 impl KittyProtoState {
-    fn new(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool) -> Self {
-        let transmit_str = transmit_virtual(img, id, is_tmux, compress);
+    fn new(
+        img: &DynamicImage,
+        id: u32,
+        is_tmux: bool,
+        compress: bool,
+        shm_pid: Option<u32>,
+    ) -> Result<Self> {
+        let transmit_str = transmit_or_shm(img, id, is_tmux, compress, shm_pid)?;
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         let id_color = format!("\x1b[38;2;{id_r};{id_g};{id_b}m");
         let id_extra = u16::from(id_extra);
-        Self {
+        Ok(Self {
             transmitted: Arc::new(AtomicBool::new(false)),
             transmit_str: Some(transmit_str),
             id: (id, id_color, id_extra),
-        }
+        })
     }
 
     // Produce the transmit sequence or None if it has already been produced before.
@@ -64,8 +77,9 @@ impl Kitty {
         id: u32,
         is_tmux: bool,
         compress: bool,
+        shm_pid: Option<u32>,
     ) -> Result<Self> {
-        let proto_state = KittyProtoState::new(&image, id, is_tmux, compress);
+        let proto_state = KittyProtoState::new(&image, id, is_tmux, compress, shm_pid)?;
         Ok(Self { proto_state, size })
     }
 
@@ -105,10 +119,11 @@ pub struct StatefulKitty {
     proto_state: KittyProtoState,
     is_tmux: bool,
     compress: bool,
+    shm_pid: Option<u32>,
 }
 
 impl StatefulKitty {
-    pub fn new(id: u32, is_tmux: bool, compress: bool) -> StatefulKitty {
+    pub fn new(id: u32, is_tmux: bool, compress: bool, shm_pid: Option<u32>) -> StatefulKitty {
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         let id_color = format!("\x1b[38;2;{id_r};{id_g};{id_b}m");
         let id_extra = u16::from(id_extra);
@@ -118,6 +133,7 @@ impl StatefulKitty {
             proto_state: KittyProtoState::default(),
             is_tmux,
             compress,
+            shm_pid,
         }
     }
 }
@@ -139,7 +155,8 @@ impl StatefulProtocolTrait for StatefulKitty {
     fn resize_encode(&mut self, img: DynamicImage, size: Size) -> Result<()> {
         self.size = size;
         // If resized then we must transmit again.
-        self.proto_state = KittyProtoState::new(&img, self.id.0, self.is_tmux, self.compress);
+        self.proto_state =
+            KittyProtoState::new(&img, self.id.0, self.is_tmux, self.compress, self.shm_pid)?;
         Ok(())
     }
 }
@@ -238,6 +255,62 @@ fn zlib(raw: &[u8]) -> Vec<u8> {
     // Writing into a `Vec` cannot fail, and neither can finishing one.
     enc.write_all(raw).expect("zlib encoder writing into a Vec");
     enc.finish().expect("zlib encoder writing into a Vec")
+}
+
+fn transmit_or_shm(
+    img: &DynamicImage,
+    id: u32,
+    is_tmux: bool,
+    compress: bool,
+    shm_pid: Option<u32>,
+) -> Result<String> {
+    #[cfg(not(windows))]
+    if let Some(pid) = shm_pid {
+        return transmit_shm(img, id, pid, is_tmux);
+    }
+    Ok(transmit_virtual(img, id, is_tmux, compress))
+}
+
+/// Transmit via POSIX shared memory object (t=s).
+///
+/// Writes raw RGBA pixels into a named SHM object, then emits a single kitty APC chunk
+/// pointing at it. The SHM object is intentionally left alive for kitty to unlink.
+#[cfg(not(windows))]
+fn transmit_shm(img: &DynamicImage, id: u32, shm_pid: u32, is_tmux: bool) -> Result<String> {
+    let (w, h) = (img.width(), img.height());
+    let img_rgba8 = img.to_rgba8();
+    let bytes = img_rgba8.as_raw();
+
+    let shm_name = format!("/ratatui-image-kitty-shm{shm_pid}-{id}");
+
+    let fd = shm::open(
+        &shm_name,
+        ShmOFlags::CREATE | ShmOFlags::RDWR | ShmOFlags::TRUNC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    rustix::fs::ftruncate(&fd, bytes.len() as u64)?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        offset += rustix_write(&fd, &bytes[offset..])?;
+    }
+    drop(fd);
+
+    let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
+
+    let payload_len = shm_name.len().div_ceil(3) * 4; // base64 upper bound
+    let mut data =
+        String::with_capacity(start.len() + escape.len() * 2 + 50 + payload_len + end.len());
+    data.push_str(start);
+    write!(
+        data,
+        "{escape}_Gq=2,i={id},a=T,U=1,f=32,t=s,s={w},v={h},m=0;"
+    )
+    .unwrap();
+    base64_simd::STANDARD.encode_append(shm_name.as_bytes(), &mut data);
+    write!(data, "{escape}\\").unwrap();
+    data.push_str(end);
+
+    Ok(data)
 }
 
 /// Create a kitty escape sequence for transmitting and virtual-placement.

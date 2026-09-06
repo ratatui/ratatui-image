@@ -56,6 +56,18 @@ pub struct QueryStdioOptions {
     /// bottleneck, such as over SSH, and the images compress well (flat
     /// colour, UI, pixel art).
     pub kitty_compression: bool,
+    /// Use POSIX shared memory objects for kitty image transmission instead of inline base64.
+    ///
+    /// The integer is included in the SHM name (typically the process PID) to make it unique
+    /// across processes. When set, images are written to a named SHM object before the kitty
+    /// escape sequence is emitted, using transmission medium `t=s`.
+    ///
+    /// See <https://sw.kovidgoyal.net/kitty/graphics-protocol/#the-transmission-medium>.
+    ///
+    /// No cleanup of the SHM object is performed on this side — kitty is responsible for
+    /// unlinking it after reading. Untransmitted kitty images must be manually cleaned up by the
+    /// user.
+    pub kitty_shared_memory_object: Option<u32>,
 }
 
 impl Default for QueryStdioOptions {
@@ -66,6 +78,7 @@ impl Default for QueryStdioOptions {
             terminal_background_color_osc: false,
             blacklist_protocols: Vec::new(),
             kitty_compression: false,
+            kitty_shared_memory_object: None,
         }
     }
 }
