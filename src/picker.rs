@@ -43,6 +43,15 @@ pub enum Capability {
     /// by default and you probably want it off. See that field's doc for
     /// when it's worth turning on.
     KittyCompression,
+    /// Reports being able to read a kitty transmission from a POSIX shared memory
+    /// object (`t=s`), which only a terminal on this machine can do.
+    ///
+    /// Probed for, and so only ever present, whenever
+    /// [`cap_parser::QueryStdioOptions::kitty_shared_memory_object`] is set: the
+    /// stdio query itself writes a real object and asks the terminal to read it
+    /// back, and [`Picker`] uses shared memory for its own transmissions only
+    /// where this capability is present.
+    KittySharedMemory,
     /// Reports font size in pixels.
     CellSize(Option<(u16, u16)>),
     /// Reports supporting text sizing protocol.
@@ -141,6 +150,11 @@ impl Picker {
                     .or(iterm2_proto)
                     .unwrap_or(ProtocolType::Halfblocks);
 
+                let kitty_shm = if caps.contains(&Capability::KittySharedMemory) {
+                    kitty_shm
+                } else {
+                    None
+                };
                 if let Some(font_size) = font_size {
                     Ok(Self {
                         font_size,
@@ -167,7 +181,8 @@ impl Picker {
                     tmux_proto.or_else(iterm2_from_env),
                     font_size_fallback(),
                 );
-                p.kitty_shm = kitty_shm;
+                // Nothing answered at all, so no capability was reported.
+                p.kitty_shm = None;
                 Ok(p)
             }
             Err(err) => Err(err),
@@ -497,7 +512,17 @@ fn query_stdio_capabilities(
     // `[1337n`: iTerm2 (some terminals implement the protocol but sadly not this custom CSI)
     // `[5n`: Device Status Report, implemented by all terminals, ensure that there is some
     // response and we don't hang reading forever.
-    let query = Parser::query(is_tmux, options);
+    let (query, shm_probe_name) = Parser::query(is_tmux, options);
+    // `Parser::query` already wrote the shared memory probe's object (if any) before
+    // naming it in the query, since the terminal must be able to open it the moment
+    // it reads the escape. Kitty/Ghostty unlink it themselves once they've read it,
+    // so this guard is for every other outcome — ignored, refused, or never
+    // answered — which would otherwise leave it behind for the life of the machine.
+    #[cfg(not(windows))]
+    let _unlink_shm_probe = shm_probe_name.map(ShmProbeUnlink);
+    #[cfg(windows)]
+    let _ = shm_probe_name;
+
     io::stdout().write_all(query.as_bytes())?;
     io::stdout().flush()?;
 
@@ -528,6 +553,24 @@ fn query_stdio_capabilities(
     Ok(())
 }
 
+/// Unlinks the named shared memory object when dropped.
+///
+/// `Parser::query` writes and names the shared-memory probe's object before this
+/// side ever sees the terminal's answer, so cleanup lives here rather than in the
+/// query builder: kitty/Ghostty unlink an object once they've read it, so a gone
+/// object at drop time is the success case, not an error (`ENOENT` is ignored) —
+/// this guard exists for every other outcome, where the terminal ignored,
+/// refused, or never answered the probe at all.
+#[cfg(not(windows))]
+struct ShmProbeUnlink(String);
+
+#[cfg(not(windows))]
+impl Drop for ShmProbeUnlink {
+    fn drop(&mut self) {
+        let _ = rustix::shm::unlink(self.0.as_str());
+    }
+}
+
 fn interpret_parser_responses(
     responses: Vec<Response>,
 ) -> Result<(Option<ProtocolType>, Option<FontSize>, Vec<Capability>)> {
@@ -556,6 +599,7 @@ fn interpret_parser_responses(
             }
             Response::RectangularOps => Some(Capability::RectangularOps),
             Response::KittyCompression => Some(Capability::KittyCompression),
+            Response::KittySharedMemory => Some(Capability::KittySharedMemory),
             Response::CellSize(cell_size) => {
                 if let Some((w, h)) = cell_size {
                     font_size = Some((*w, *h).into());
@@ -651,10 +695,59 @@ mod tests {
 
     use crate::{
         FontSize,
-        picker::{Capability, Picker, ProtocolType},
+        picker::{Capability, Picker, ProtocolType, cap_parser::QueryStdioOptions},
     };
 
     use super::{cap_parser::Response, fallback_picker, interpret_parser_responses};
+
+    /// Exercises the query-side probe end to end: `Parser::query` writes a real
+    /// object and names it in the escape, and `ShmProbeUnlink` — the guard
+    /// `query_stdio_capabilities` wraps the name in — is what's responsible for
+    /// cleaning it up afterward. The object has to actually exist while the
+    /// guard is alive and actually be gone once it drops, not just the string
+    /// plumbing between the two.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_shm_probe_round_trips() {
+        use super::ShmProbeUnlink;
+
+        let (_query, name) = super::cap_parser::Parser::query(
+            false,
+            QueryStdioOptions {
+                kitty_shared_memory_object: Some(std::process::id()),
+                ..Default::default()
+            },
+        );
+        let name = name.expect("this platform writes shared memory");
+
+        let fd = rustix::shm::open(
+            name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("the object exists before the guard has dropped");
+        // At least the one RGBA pixel `f=32,s=1,v=1` promises, since a terminal
+        // rejects an object smaller than `s * v * bpp`. Not exactly: macOS rounds
+        // a shared memory object up to a page, so this reads 16384 there and 4 on
+        // Linux, and only the floor is a portable claim.
+        let size = rustix::fs::fstat(&fd).expect("stat the object").st_size;
+        assert!(
+            size >= 4,
+            "the probe object holds one RGBA pixel, got {size}"
+        );
+        drop(fd);
+
+        drop(ShmProbeUnlink(name.clone()));
+        assert!(
+            rustix::shm::open(
+                name.as_str(),
+                rustix::shm::OFlags::RDONLY,
+                rustix::fs::Mode::empty(),
+            )
+            .is_err(),
+            "the guard leaves nothing behind for a terminal that never read it"
+        );
+    }
 
     #[test]
     fn test_cycle_protocol() {
