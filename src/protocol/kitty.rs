@@ -10,16 +10,19 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(any(windows, target_os = "linux")))]
+use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 #[cfg(not(windows))]
 use rustix::{
     fs::Mode,
-    io::write as rustix_write,
     shm::{self, OFlags as ShmOFlags},
 };
 
 use crate::protocol::UNIT_WIDTH;
 use crate::{Result, picker::cap_parser::Parser};
 use image::DynamicImage;
+#[cfg(not(windows))]
+use rand::random;
 use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::{buffer::Buffer, layout::Rect};
@@ -44,7 +47,19 @@ impl KittyProtoState {
         compress: bool,
         shm_pid: Option<u32>,
     ) -> Result<Self> {
-        let transmit_str = transmit_or_shm(img, id, is_tmux, compress, shm_pid)?;
+        // The only caller that holds a `DynamicImage`: every transmit path below
+        // takes raw RGBA bytes plus dimensions, so the conversion happens once,
+        // here, rather than once per path.
+        let img_rgba8 = img.to_rgba8();
+        let transmit_str = transmit_or_shm(
+            img_rgba8.as_raw(),
+            img.width(),
+            img.height(),
+            id,
+            is_tmux,
+            compress,
+            shm_pid,
+        )?;
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         Ok(Self {
             transmitted: Arc::new(AtomicBool::new(false)),
@@ -223,7 +238,9 @@ fn zlib(raw: &[u8]) -> Vec<u8> {
 }
 
 fn transmit_or_shm(
-    img: &DynamicImage,
+    bytes: &[u8],
+    w: u32,
+    h: u32,
     id: u32,
     is_tmux: bool,
     compress: bool,
@@ -231,34 +248,148 @@ fn transmit_or_shm(
 ) -> Result<String> {
     #[cfg(not(windows))]
     if let Some(pid) = shm_pid {
-        return transmit_shm(img, id, pid, is_tmux);
+        return transmit_shm(bytes, w, h, id, pid, is_tmux);
     }
-    Ok(transmit_virtual(img, id, is_tmux, compress))
+    Ok(transmit_base64(bytes, w, h, id, is_tmux, compress))
+}
+
+/// Create a shared memory object of exactly `bytes.len()` and fill it.
+///
+/// **Linux writes through the descriptor.** `write(2)` on a POSIX shared memory
+/// object allocates the `tmpfs` pages it touches inside the syscall itself —
+/// unlike `ftruncate`, which only names a length and lets `tmpfs` allocate on
+/// first touch — so there is nothing to reserve up front and no mapping to make:
+/// an object bigger than the space left in `/dev/shm` (64 MB by default in a
+/// Docker container) answers `write_all` with an ordinary `io::Error` — `ENOSPC`,
+/// or a short write — which the caller already turns into a fallback like any
+/// other failure. `ftruncate` is unnecessary too, since the write itself sets the
+/// object's length. `shm::open` hands back an `OwnedFd`, and `File`'s `From`
+/// impl for it needs no `unsafe` at all.
+///
+/// The object still ends up sized to exactly the payload — a terminal rejects one
+/// smaller than `s * v * bpp` (Ghostty: "shared memory size too small") — which
+/// falls out of writing exactly `bytes.len()` bytes to a fresh object.
+///
+/// Linux is the one target with its own function because it is the one target
+/// where mapping a shared memory object can fail at runtime instead of at open
+/// time: a mapping that outruns a `tmpfs` short on pages faults with `SIGBUS` on
+/// first touch, past any `Result` this crate could hand back. `write(2)` turns
+/// the same shortage into an ordinary `io::Error` instead, so Linux writes and
+/// every other Unix maps (see this function's twin below).
+#[cfg(target_os = "linux")]
+pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    let fd = shm::open(
+        name,
+        ShmOFlags::CREATE | ShmOFlags::RDWR | ShmOFlags::TRUNC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    std::fs::File::from(fd).write_all(bytes)?;
+    Ok(())
+}
+
+/// Create a shared memory object of exactly `bytes.len()` and fill it.
+///
+/// **Every non-Linux Unix goes in through a mapping instead of `write(2)`.**
+/// `mmap` is the one operation POSIX actually promises on a shared memory
+/// object; `write` is a per-kernel courtesy on top of it, and this crate has
+/// already met both ends of that: macOS refuses it outright with `ENXIO`
+/// (there is no read/write path on its shared memory objects at all), while
+/// FreeBSD happens to allow it but is untested here. Mapping is also what the
+/// terminal itself uses to read the object back, so this is the operation
+/// every reader on these platforms is already relying on. `ftruncate` alone
+/// reserves what it names — these objects are ordinary anonymous memory with
+/// no separate `tmpfs` quota to run out of the way Linux's can (see the
+/// `target_os = "linux"` twin of this function, above, for why Linux writes
+/// instead). The cfg spells "every Unix but Linux", not "macOS": the crate
+/// draws no line between the rest anywhere else, and this function shouldn't
+/// either.
+///
+/// The object is sized to exactly the payload, since a terminal rejects one
+/// smaller than `s * v * bpp` (Ghostty: "shared memory size too small").
+#[cfg(not(any(windows, target_os = "linux")))]
+pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
+    let fd = shm::open(
+        name,
+        ShmOFlags::CREATE | ShmOFlags::RDWR | ShmOFlags::TRUNC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    rustix::fs::ftruncate(&fd, bytes.len() as u64)?;
+    // SAFETY: a fresh mapping of a descriptor we just created and sized to
+    // `bytes.len()`, written once and unmapped before it can be aliased.
+    unsafe {
+        let ptr = mmap(
+            std::ptr::null_mut(),
+            bytes.len(),
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::SHARED,
+            &fd,
+            0,
+        )?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+        munmap(ptr, bytes.len())?;
+    }
+    Ok(())
+}
+
+/// The name of the shared memory object one TRANSMIT is handed over in.
+///
+/// Short on purpose. POSIX only promises 14 bytes and Linux allows 255, but macOS
+/// caps the whole name at 31 bytes including the leading slash (`PSHMNAMLEN`), and
+/// anything longer is refused with `ENAMETOOLONG` — measured on macOS 15, where
+/// `/ratatui-image-kitty-shm12345-4294967295` never opens at all. A refused
+/// transmit is silent: the image is never stored, and every placement naming it
+/// draws nothing. So the name has to fit the smallest limit we ship on, which at
+/// u32's widest this does exactly.
+///
+/// `serial` is not the kitty image id — see [`transmit_shm`] for why the two must
+/// not be conflated. `pub(crate)` so the shared-memory probe in
+/// [`crate::picker::cap_parser`] can name its own object the same way a real
+/// transmit does, without going through the display escape [`transmit_shm`]
+/// builds around it (the probe's query escape is a different shape).
+#[cfg(not(windows))]
+pub(crate) fn shm_name(shm_pid: u32, serial: u32) -> String {
+    format!("/rtui-{shm_pid}-{serial}")
 }
 
 /// Transmit via POSIX shared memory object (t=s).
 ///
 /// Writes raw RGBA pixels into a named SHM object, then emits a single kitty APC chunk
-/// pointing at it. The SHM object is intentionally left alive for kitty to unlink.
+/// pointing at it. The SHM object is intentionally left alive for kitty to unlink —
+/// and if the caller never consumes this transmit with a render (a dropped frame in
+/// a threaded caller, say), that object is left for the caller to clean up by hand,
+/// the same way an untransmitted base64 image is left marked transmitted but never
+/// shown.
+///
+/// **The object is named from a per-transmit random suffix, never from the kitty
+/// image id, and never from a second counter either.** `id` is stable across
+/// re-transmits of the same picture — deliberately, a caller such as
+/// [`StatefulKitty::resize_encode`] or a `new_protocol_with_id` caller reuses it
+/// exactly so a placement need not be rebuilt — but the object handover is
+/// ASYNCHRONOUS in a way the escape stream itself is not: a repeated base64
+/// transmit under one `id` is harmless, because the wire is ordered and the
+/// terminal simply replaces the image when it gets to the second one. A repeated
+/// shm NAME is not, because the terminal opens and reads that object whenever it
+/// next gets to it, independent of when the next transmit runs; naming the object
+/// after `id` would let a second transmit recreate (`O_CREAT|O_TRUNC`) the very
+/// object the terminal may still be midway through reading for the first one, so
+/// it finds truncated bytes, the wrong frame's bytes, or nothing at all (Ghostty
+/// answers with "shared memory size too small" and drops the frame). `rand::random`
+/// serves the suffix precisely because [`crate::picker::Picker`] already draws
+/// kitty image ids the same way — no second atomic earns its keep for one more
+/// number in the same space.
 #[cfg(not(windows))]
-fn transmit_shm(img: &DynamicImage, id: u32, shm_pid: u32, is_tmux: bool) -> Result<String> {
-    let (w, h) = (img.width(), img.height());
-    let img_rgba8 = img.to_rgba8();
-    let bytes = img_rgba8.as_raw();
-
-    let shm_name = format!("/ratatui-image-kitty-shm{shm_pid}-{id}");
-
-    let fd = shm::open(
-        &shm_name,
-        ShmOFlags::CREATE | ShmOFlags::RDWR | ShmOFlags::TRUNC,
-        Mode::RUSR | Mode::WUSR,
-    )?;
-    rustix::fs::ftruncate(&fd, bytes.len() as u64)?;
-    let mut offset = 0;
-    while offset < bytes.len() {
-        offset += rustix_write(&fd, &bytes[offset..])?;
-    }
-    drop(fd);
+fn transmit_shm(
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+    id: u32,
+    shm_pid: u32,
+    is_tmux: bool,
+) -> Result<String> {
+    let shm_name = shm_name(shm_pid, random());
+    shm_write(&shm_name, bytes)?;
 
     let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
 
@@ -296,14 +427,11 @@ fn transmit_shm(img: &DynamicImage, id: u32, shm_pid: u32, is_tmux: bool) -> Res
 /// `compress` must only be set when the terminal answered the `o=z` capability
 /// probe: a terminal that cannot inflate refuses the transmission outright, and
 /// every placement naming the image then draws nothing at all.
-fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool) -> String {
-    let (w, h) = (img.width(), img.height());
-    let img_rgba8 = img.to_rgba8();
-    let raw = img_rgba8.as_raw();
+fn transmit_base64(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool, compress: bool) -> String {
     let bytes: Cow<[u8]> = if compress {
-        Cow::Owned(zlib(raw))
+        Cow::Owned(zlib(bytes))
     } else {
-        Cow::Borrowed(raw)
+        Cow::Borrowed(bytes)
     };
     let compression = if compress { "o=z," } else { "" };
 
@@ -659,7 +787,7 @@ fn diacritic(y: u16) -> char {
 
 #[cfg(test)]
 mod tests {
-    use super::{DIACRITICS, PLACEHOLDER, diacritic, render, transmit_virtual};
+    use super::{DIACRITICS, PLACEHOLDER, diacritic, render, transmit_base64};
     use image::{DynamicImage, RgbaImage};
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Rect, Size};
@@ -839,7 +967,15 @@ mod tests {
     #[test]
     fn transmit_without_compression_is_the_raw_image() {
         let img = canvas();
-        let (params, bytes) = reassemble(&transmit_virtual(&img, 7, false, false));
+        let raw = img.to_rgba8();
+        let (params, bytes) = reassemble(&transmit_base64(
+            raw.as_raw(),
+            img.width(),
+            img.height(),
+            7,
+            false,
+            false,
+        ));
         assert!(
             !params.contains("o=z"),
             "nothing claims to be compressed: {params}"
@@ -859,7 +995,15 @@ mod tests {
     #[test]
     fn transmit_with_compression_inflates_back_to_the_raw_image() {
         let img = canvas();
-        let (params, bytes) = reassemble(&transmit_virtual(&img, 7, false, true));
+        let raw = img.to_rgba8();
+        let (params, bytes) = reassemble(&transmit_base64(
+            raw.as_raw(),
+            img.width(),
+            img.height(),
+            7,
+            false,
+            true,
+        ));
         assert!(
             params.contains("o=z"),
             "the payload is compressed and says so: {params}"
@@ -877,7 +1021,6 @@ mod tests {
             "`S` is for PNG-plus-compression, and this is f=32"
         );
 
-        let raw = img.to_rgba8();
         assert!(
             bytes.len() < raw.as_raw().len(),
             "{} vs {}",
@@ -888,5 +1031,64 @@ mod tests {
         std::io::copy(&mut flate2::read::ZlibDecoder::new(&bytes[..]), &mut out)
             .expect("the whole payload is one zlib stream");
         assert_eq!(out, *raw.as_raw());
+    }
+
+    /// macOS refuses a shared memory name longer than 31 bytes, and a refused
+    /// transmit draws nothing rather than saying so — so the widest name the
+    /// scheme can produce has to fit, not merely a typical one. The serial is a
+    /// `u32` exactly so this stays true: a `u64` serial's widest value would blow
+    /// the budget the pid alone already spends most of.
+    #[test]
+    #[cfg(not(windows))]
+    fn shm_names_fit_the_tightest_platform_limit() {
+        const PSHMNAMLEN: usize = 31;
+        let widest = super::shm_name(u32::MAX, u32::MAX);
+        assert!(
+            widest.len() <= PSHMNAMLEN,
+            "`{widest}` is {} bytes, macOS allows {PSHMNAMLEN}",
+            widest.len()
+        );
+        assert!(
+            widest.starts_with('/') && !widest[1..].contains('/'),
+            "one leading slash and no others, for portability: {widest}"
+        );
+    }
+
+    /// Two transmits of the SAME image id must still land in two different
+    /// objects — that is the entire fix: the terminal owns the first object
+    /// asynchronously from the moment its escape is written, and a second
+    /// transmit reusing that name would recreate it out from under a reader that
+    /// has not gotten to it yet. See [`super::transmit_shm`]'s doc comment.
+    #[test]
+    #[cfg(not(windows))]
+    fn consecutive_shm_transmits_of_the_same_id_use_different_objects() {
+        let img = canvas();
+        let raw = img.to_rgba8();
+        let pid = std::process::id();
+        let first = super::transmit_shm(raw.as_raw(), img.width(), img.height(), 7, pid, false)
+            .expect("this platform writes shared memory");
+        let second = super::transmit_shm(raw.as_raw(), img.width(), img.height(), 7, pid, false)
+            .expect("this platform writes shared memory");
+
+        let name_of = |seq: &str| {
+            let start = seq.find(";").expect("payload starts after the header") + 1;
+            let end = seq.rfind("\x1b\\").expect("the ST ends the payload");
+            let name = base64_simd::STANDARD
+                .decode_to_vec(&seq[start..end])
+                .expect("the payload is base64");
+            String::from_utf8(name).expect("the object name is ASCII")
+        };
+        let (first_name, second_name) = (name_of(&first), name_of(&second));
+        assert_ne!(
+            first_name, second_name,
+            "same image id (7), but the object name must still differ so the second \
+             transmit can never touch an object the terminal may still be reading \
+             from the first: {first_name:?} vs {second_name:?}"
+        );
+
+        // Clean up: a successful `t=s` transmit is left for the terminal to
+        // unlink, which nothing here plays the part of.
+        let _ = rustix::shm::unlink(first_name);
+        let _ = rustix::shm::unlink(second_name);
     }
 }
