@@ -3,6 +3,9 @@
 //! Transmits the image once on first render, tracked via an AtomicBool, and then subsequentially
 //! renders the image with the [unicode-placeholders] feature of the [kitty protocol].
 //!
+//! Each cell of the placement is written as its own cell, carrying its own row,
+//! column and image-id diacritics.
+//!
 //! [unicode-placeholders]: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
 //! [kitty protocol]: https://sw.kovidgoyal.net/kitty/graphics-protocol
 use std::borrow::Cow;
@@ -13,29 +16,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::protocol::UNIT_WIDTH;
 use crate::{Result, picker::cap_parser::Parser};
 use image::DynamicImage;
-use ratatui::buffer::CellDiffOption;
 use ratatui::layout::Size;
+use ratatui::style::Color;
 use ratatui::{buffer::Buffer, layout::Rect};
 
 use super::{ProtocolTrait, StatefulProtocolTrait};
+
+/// The character kitty reserves for image placeholders.
+const PLACEHOLDER: char = '\u{10EEEE}';
 
 #[derive(Default, Clone)]
 struct KittyProtoState {
     transmitted: Arc<AtomicBool>,
     transmit_str: Option<String>,
-    id: (u32, String, u16), // Full ID, Formatted color ID, ID extra part for diacritic
+    id: (u32, u16), // Full ID, ID extra part for diacritic
 }
 
 impl KittyProtoState {
     fn new(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool) -> Self {
         let transmit_str = transmit_virtual(img, id, is_tmux, compress);
-        let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
-        let id_color = format!("\x1b[38;2;{id_r};{id_g};{id_b}m");
-        let id_extra = u16::from(id_extra);
+        let [id_extra, ..] = id.to_be_bytes();
         Self {
             transmitted: Arc::new(AtomicBool::new(false)),
             transmit_str: Some(transmit_str),
-            id: (id, id_color, id_extra),
+            id: (id, u16::from(id_extra)),
         }
     }
 
@@ -100,7 +104,7 @@ impl ProtocolTrait for Kitty {
 
 #[derive(Clone)]
 pub struct StatefulKitty {
-    id: (u32, String, u16), // Full ID, Formatted color ID, ID extra part for diacritic
+    id: (u32, u16), // Full ID, ID extra part for diacritic
     size: Size,
     proto_state: KittyProtoState,
     is_tmux: bool,
@@ -109,11 +113,9 @@ pub struct StatefulKitty {
 
 impl StatefulKitty {
     pub fn new(id: u32, is_tmux: bool, compress: bool) -> StatefulKitty {
-        let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
-        let id_color = format!("\x1b[38;2;{id_r};{id_g};{id_b}m");
-        let id_extra = u16::from(id_extra);
+        let [id_extra, ..] = id.to_be_bytes();
         StatefulKitty {
-            id: (id, id_color, id_extra),
+            id: (id, u16::from(id_extra)),
             size: Size::default(),
             proto_state: KittyProtoState::default(),
             is_tmux,
@@ -148,78 +150,59 @@ fn render(
     area: Rect,
     size: Size,
     buf: &mut Buffer,
-    (_, id_color, id_extra): &(u32, String, u16),
+    (id, id_extra): &(u32, u16),
     mut seq: Option<&str>,
     skip_line_count: usize,
 ) {
-    let full_width = area.width.min(size.width);
-    let width_usize = usize::from(full_width);
+    // The id's low three bytes travel as the cell's foreground colour and its
+    // high byte as a third diacritic; that pairing is how kitty ties a
+    // placeholder back to the image it should show.
+    let [_, id_r, id_g, id_b] = id.to_be_bytes();
+    let fg = Color::Rgb(id_r, id_g, id_b);
 
-    let estimated_placeholder_row_size = id_color.len() +
-        30 +  // diacritics
-        (width_usize * 4) +
-        30; // restore cursor dance
-    let estimated_transmit_row_size =
-        estimated_placeholder_row_size + if let Some(seq) = seq { seq.len() } else { 0 };
-    let mut symbol = String::with_capacity(estimated_transmit_row_size);
+    // A position past the end of the diacritic table cannot be encoded, so
+    // those cells are left undrawn rather than shown at the wrong offset.
+    // Columns need this as much as rows now that each one is explicit.
+    let max = DIACRITICS.len() as u16;
+    let width = area.width.min(size.width).min(max);
+    let height = area.height.min(size.height).min(max);
 
-    let row_diacritics: String = std::iter::repeat_n('\u{10EEEE}', width_usize - 1).collect();
-
-    // Restore saved cursor position including color, and now we have to move back to
-    // the end of the area.
-    let right = area.width - 1;
-    let down = area.height - 1;
-    let restore_cursor = format!("\x1b[u\x1b[{right}C\x1b[{down}B");
-
-    // Clamp to effectively 297, the number of placeholders in the Kitty protocol.
-    // Anything beyond would just render the something that's wrong, so skip.
-    let height = area.height.min(size.height).min(DIACRITICS.len() as u16);
+    let mut symbol = String::with_capacity(64);
     for y in 0..height {
-        // Draw each line of unicode placeholders but all into the first cell.
-        // I couldn't work out actually drawing into each cell of the buffer so
-        // that `.set_skip(true)` would be made unnecessary. Maybe some other escape
-        // sequence gets sneaked in somehow.
-        // It could also be made so that each cell starts and ends its own escape sequence
-        // with the image id, but maybe that's worse.
-        symbol.clear();
-        if y == 1 {
-            symbol.shrink_to(estimated_placeholder_row_size);
-        }
+        let row = y + skip_line_count as u16;
+        for x in 0..width {
+            let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) else {
+                continue;
+            };
 
-        // If not transmitted in previous renders, only transmit once at the
-        // first line.
-        if let Some(seq) = seq.take() {
-            symbol.push_str(seq);
-        }
-
-        let row_y = y + skip_line_count as u16;
-
-        // Save cursor position, including fg color which is what we want, and start the unicode
-        // placeholder sequence
-        write!(
-            symbol,
-            "\x1b[s{id_color}\u{10EEEE}{}{}{}",
-            diacritic(row_y),
-            diacritic(0),
-            diacritic(*id_extra)
-        )
-        .unwrap();
-
-        // Add entire row with positions
-        // Use inherited diacritic values
-        symbol.push_str(&row_diacritics);
-
-        for x in 1..full_width {
-            // Skip or something may overwrite it
-            if let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) {
-                cell.set_diff_option(CellDiffOption::Skip);
+            symbol.clear();
+            // The transmission rides along on the first cell actually drawn.
+            // It renders nothing itself, so prefixing a placeholder with it is
+            // safe, and taking it here means it is emitted exactly once.
+            if let Some(seq) = seq.take() {
+                symbol.push_str(seq);
             }
-        }
 
-        symbol.push_str(&restore_cursor);
+            // A bare placeholder inherits the row from the cell to its left
+            // and increments the column, as long as the two share a foreground
+            // colour -- which they do, since the id is set on every cell. So
+            // only the first cell of a row has to state a position, and the
+            // rest cost one character each.
+            //
+            // What matters is that they are separate *cells*: a multiplexer
+            // stores one glyph plus a few combining marks per cell, so a row
+            // packed into a single cell arrives malformed however the
+            // diacritics are arranged.
+            symbol.push(PLACEHOLDER);
+            if x == 0 {
+                symbol.push(diacritic(row));
+                symbol.push(diacritic(x));
+                symbol.push(diacritic(*id_extra));
+            }
 
-        if let Some(cell) = buf.cell_mut((area.left(), area.top() + y)) {
-            cell.set_symbol(&symbol).set_diff_option(UNIT_WIDTH);
+            cell.set_symbol(&symbol)
+                .set_fg(fg)
+                .set_diff_option(UNIT_WIDTH);
         }
     }
 }
@@ -621,8 +604,139 @@ fn diacritic(y: u16) -> char {
 
 #[cfg(test)]
 mod tests {
-    use super::transmit_virtual;
+    use super::{DIACRITICS, PLACEHOLDER, diacritic, render, transmit_virtual};
     use image::{DynamicImage, RgbaImage};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::{Rect, Size};
+    use ratatui::style::Color;
+
+    /// The diacritics on one placeholder cell, after the placeholder itself.
+    fn marks(buf: &Buffer, x: u16, y: u16) -> Vec<char> {
+        let mut chars = buf[(x, y)].symbol().chars();
+        assert_eq!(
+            chars.next(),
+            Some(PLACEHOLDER),
+            "cell {x},{y} is not a placeholder"
+        );
+        chars.collect()
+    }
+
+    /// The fix: one placeholder per buffer cell. Packing a row into a single
+    /// cell also relies on inheritance, but a multiplexer stores one glyph
+    /// plus a few combining marks per cell, so the row arrives collapsed and
+    /// nothing is placed.
+    #[test]
+    fn each_cell_holds_exactly_one_placeholder() {
+        let area = Rect::new(0, 0, 4, 3);
+        let mut buf = Buffer::empty(area);
+        render(area, Size::new(4, 3), &mut buf, &(0x0102_0304, 1), None, 0);
+
+        for y in 0..3 {
+            for x in 0..4 {
+                let placeholders = buf[(x, y)]
+                    .symbol()
+                    .chars()
+                    .filter(|c| *c == PLACEHOLDER)
+                    .count();
+                assert_eq!(placeholders, 1, "cell {x},{y} holds {placeholders}");
+            }
+        }
+    }
+
+    /// Only the first cell of a row states a position; the rest inherit the
+    /// row and increment the column, which kitty allows because every cell
+    /// carries the same foreground colour.
+    #[test]
+    fn only_the_first_cell_of_a_row_states_a_position() {
+        let area = Rect::new(0, 0, 4, 3);
+        let mut buf = Buffer::empty(area);
+        render(area, Size::new(4, 3), &mut buf, &(0x0102_0304, 1), None, 0);
+
+        for y in 0..3 {
+            assert_eq!(
+                marks(&buf, 0, y),
+                vec![diacritic(y), diacritic(0), diacritic(1)],
+                "row {y} must state its position"
+            );
+            for x in 1..4 {
+                assert!(
+                    marks(&buf, x, y).is_empty(),
+                    "cell {x},{y} repeats a position it could inherit"
+                );
+            }
+        }
+    }
+
+    /// The id's low three bytes are the foreground colour. Carrying it as a
+    /// cell attribute rather than an escape inside one cell's symbol is what
+    /// lets it survive being re-emitted cell by cell.
+    #[test]
+    fn the_id_rides_in_the_foreground_colour() {
+        let area = Rect::new(0, 0, 2, 1);
+        let mut buf = Buffer::empty(area);
+        render(area, Size::new(2, 1), &mut buf, &(0x00AA_BBCC, 0), None, 0);
+
+        for x in 0..2 {
+            assert_eq!(buf[(x, 0)].style().fg, Some(Color::Rgb(0xAA, 0xBB, 0xCC)));
+        }
+    }
+
+    /// The transmission is prefixed to the first cell drawn and to no other,
+    /// so it reaches the terminal exactly once per render.
+    #[test]
+    fn the_transmission_is_emitted_once() {
+        let area = Rect::new(0, 0, 3, 2);
+        let mut buf = Buffer::empty(area);
+        render(
+            area,
+            Size::new(3, 2),
+            &mut buf,
+            &(1, 0),
+            Some("<TRANSMIT>"),
+            0,
+        );
+
+        assert!(
+            buf[(0, 0)].symbol().starts_with("<TRANSMIT>"),
+            "the first cell carries the transmission"
+        );
+        for (x, y) in [(1, 0), (2, 0), (0, 1), (1, 1), (2, 1)] {
+            assert!(
+                !buf[(x, y)].symbol().contains("<TRANSMIT>"),
+                "cell {x},{y} repeated the transmission"
+            );
+        }
+    }
+
+    /// Rows and columns are both encoded by table lookup, so both have to stop
+    /// at the end of the table rather than silently drawing a wrong position.
+    #[test]
+    fn positions_past_the_diacritic_table_are_left_undrawn() {
+        let over = DIACRITICS.len() as u16 + 4;
+        let area = Rect::new(0, 0, over, 2);
+        let mut buf = Buffer::empty(area);
+        render(area, Size::new(over, 2), &mut buf, &(1, 0), None, 0);
+
+        let last = DIACRITICS.len() as u16 - 1;
+        assert_eq!(buf[(last, 0)].symbol().chars().next(), Some(PLACEHOLDER));
+        assert_ne!(
+            buf[(last + 1, 0)].symbol().chars().next(),
+            Some(PLACEHOLDER),
+            "a column with no diacritic must not be drawn"
+        );
+    }
+
+    /// SlicedImage renders a window onto a taller placement, so the row
+    /// diacritic has to be the row within the image, not within the area.
+    #[test]
+    fn skip_line_count_offsets_the_row_diacritic() {
+        let area = Rect::new(0, 0, 1, 2);
+        let mut buf = Buffer::empty(area);
+        render(area, Size::new(1, 2), &mut buf, &(1, 0), None, 5);
+
+        assert_eq!(marks(&buf, 0, 0)[0], diacritic(5));
+        assert_eq!(marks(&buf, 0, 1)[0], diacritic(6));
+    }
 
     fn canvas() -> DynamicImage {
         // Flat bands: artwork, not noise, which is what deflate is for and what
