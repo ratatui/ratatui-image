@@ -634,6 +634,19 @@ fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; STDIN_READ_SIZE]) -> Result<us
     if ready == 0 {
         return Err(Errors::NoStdinResponse);
     }
+
+    let revents = pollfds[0].revents();
+
+    // https://man7.org/linux/man-pages/man2/poll.2.html
+    // POLLIN - There is data to read.
+    // POLLHUP - Hung up but there may still be data to read.
+    // The remaining events mean that something's wrong.
+    let readable = revents == PollFlags::IN || revents == (PollFlags::IN | PollFlags::HUP);
+
+    if !readable {
+        return Err(Errors::NoStdinResponse);
+    }
+
     // Important to use rustix::io::read and not std::io::read, which can do its userspace
     // buffering, where poll() would return 0 on next read.
     Ok(read(stdin_fd, charbuf)?)
