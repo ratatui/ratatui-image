@@ -3,6 +3,7 @@
 use std::{
     env,
     io::{self, Write},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -565,11 +566,22 @@ fn query_with_timeout(
     interpret_parser_responses(responses)
 }
 
+// The important thing is that stdin reading must work with any size.
+const STDIN_READ_SIZE: usize = 64;
+
 fn poll_and_parse(timeout_ms: i32) -> Result<Vec<Response>> {
     let mut parser = Parser::new();
     let mut responses = vec![];
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
     loop {
-        let mut charbuf: [u8; 50] = [0; 50];
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Errors::NoStdinResponse);
+        }
+        // Don't let poll() overshoot the deadline, however unlikely.
+        let timeout_ms = remaining.as_millis() as i32;
+
+        let mut charbuf: [u8; STDIN_READ_SIZE] = [0; STDIN_READ_SIZE];
         let read_count = poll_stdin(timeout_ms, &mut charbuf)?;
         for ch in charbuf.iter().take(read_count) {
             let mut more_caps = parser.push(char::from(*ch));
@@ -582,10 +594,10 @@ fn poll_and_parse(timeout_ms: i32) -> Result<Vec<Response>> {
 }
 
 #[cfg(not(windows))]
-fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; 50]) -> Result<usize> {
+fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; STDIN_READ_SIZE]) -> Result<usize> {
     use rustix::event::{PollFd, PollFlags, poll};
     use rustix::fd::AsFd;
-    use std::io::Read;
+    use rustix::io::read;
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
     let mut pollfds = [PollFd::new(&stdin_fd, PollFlags::IN)];
@@ -593,11 +605,13 @@ fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; 50]) -> Result<usize> {
     if ready == 0 {
         return Err(Errors::NoStdinResponse);
     }
-    Ok((&stdin).read(charbuf)?)
+    // Important to use rustix::io::read and not std::io::read, which can do its userspace
+    // buffering, where poll() would return 0 on next read.
+    Ok(read(stdin_fd, charbuf)?)
 }
 
 #[cfg(windows)]
-fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; 50]) -> Result<usize> {
+fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; STDIN_READ_SIZE]) -> Result<usize> {
     use std::time::{Duration, Instant};
     use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, WAIT_TIMEOUT};
     use windows::Win32::Storage::FileSystem::{
