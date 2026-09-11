@@ -49,6 +49,7 @@ windows = { version = "0.58.0", default-features = false, features = [
   "Win32_System_Console",
   "Win32_Storage_FileSystem",
   "Win32_Security",
+  "Win32_System_Threading",
 ] }
 
 [[bin]]
