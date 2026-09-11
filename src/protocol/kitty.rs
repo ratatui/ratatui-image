@@ -229,6 +229,7 @@ fn zlib(raw: &[u8]) -> Vec<u8> {
     enc.finish().expect("zlib encoder writing into a Vec")
 }
 
+#[cfg_attr(windows, allow(unused_variables))]
 fn transmit_or_shm(
     bytes: &[u8],
     w: u32,
