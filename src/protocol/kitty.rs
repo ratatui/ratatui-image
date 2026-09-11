@@ -21,8 +21,6 @@ use rustix::{
 use crate::protocol::UNIT_WIDTH;
 use crate::{Result, picker::cap_parser::Parser};
 use image::DynamicImage;
-#[cfg(not(windows))]
-use rand::random;
 use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::{buffer::Buffer, layout::Rect};
@@ -40,13 +38,7 @@ struct KittyProtoState {
 }
 
 impl KittyProtoState {
-    fn new(
-        img: &DynamicImage,
-        id: u32,
-        is_tmux: bool,
-        compress: bool,
-        shm_pid: Option<u32>,
-    ) -> Result<Self> {
+    fn new(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool, smo: bool) -> Result<Self> {
         // The only caller that holds a `DynamicImage`: every transmit path below
         // takes raw RGBA bytes plus dimensions, so the conversion happens once,
         // here, rather than once per path.
@@ -58,7 +50,7 @@ impl KittyProtoState {
             id,
             is_tmux,
             compress,
-            shm_pid,
+            smo,
         )?;
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         Ok(Self {
@@ -93,9 +85,9 @@ impl Kitty {
         id: u32,
         is_tmux: bool,
         compress: bool,
-        shm_pid: Option<u32>,
+        smo: bool,
     ) -> Result<Self> {
-        let proto_state = KittyProtoState::new(&image, id, is_tmux, compress, shm_pid)?;
+        let proto_state = KittyProtoState::new(&image, id, is_tmux, compress, smo)?;
         Ok(Self { proto_state, size })
     }
 
@@ -135,11 +127,11 @@ pub struct StatefulKitty {
     proto_state: KittyProtoState,
     is_tmux: bool,
     compress: bool,
-    shm_pid: Option<u32>,
+    smo: bool,
 }
 
 impl StatefulKitty {
-    pub fn new(id: u32, is_tmux: bool, compress: bool, shm_pid: Option<u32>) -> StatefulKitty {
+    pub fn new(id: u32, is_tmux: bool, compress: bool, smo: bool) -> StatefulKitty {
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         StatefulKitty {
             id: (id, Color::Rgb(id_r, id_g, id_b), u16::from(id_extra)),
@@ -147,7 +139,7 @@ impl StatefulKitty {
             proto_state: KittyProtoState::default(),
             is_tmux,
             compress,
-            shm_pid,
+            smo,
         }
     }
 }
@@ -170,7 +162,7 @@ impl StatefulProtocolTrait for StatefulKitty {
         self.size = size;
         // If resized then we must transmit again.
         self.proto_state =
-            KittyProtoState::new(&img, self.id.0, self.is_tmux, self.compress, self.shm_pid)?;
+            KittyProtoState::new(&img, self.id.0, self.is_tmux, self.compress, self.smo)?;
         Ok(())
     }
 }
@@ -244,16 +236,16 @@ fn transmit_or_shm(
     id: u32,
     is_tmux: bool,
     compress: bool,
-    shm_pid: Option<u32>,
+    smo: bool,
 ) -> Result<String> {
     #[cfg(not(windows))]
-    if let Some(pid) = shm_pid {
-        return transmit_shm(bytes, w, h, id, pid, is_tmux);
+    if smo {
+        return transmit_shm(bytes, w, h, id, is_tmux);
     }
     Ok(transmit_base64(bytes, w, h, id, is_tmux, compress))
 }
 
-/// Create a shared memory object of exactly `bytes.len()` and fill it.
+/// Create a shared memory object.
 ///
 /// **Linux writes through the descriptor.** `write(2)` on a POSIX shared memory
 /// object allocates the `tmpfs` pages it touches inside the syscall itself —
@@ -333,24 +325,29 @@ pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The name of the shared memory object one TRANSMIT is handed over in.
+/// The name of the shared memory object filename: `/rtui-<16bit random base64>`.
 ///
-/// Short on purpose. POSIX only promises 14 bytes and Linux allows 255, but macOS
-/// caps the whole name at 31 bytes including the leading slash (`PSHMNAMLEN`), and
-/// anything longer is refused with `ENAMETOOLONG` — measured on macOS 15, where
-/// `/ratatui-image-kitty-shm12345-4294967295` never opens at all. A refused
-/// transmit is silent: the image is never stored, and every placement naming it
-/// draws nothing. So the name has to fit the smallest limit we ship on, which at
-/// u32's widest this does exactly.
+/// POSIX defines _POSIX_NAME_MAX as 14 for filename components, but shm_open() has
+/// implementation-defined name-length limits.
+/// Linux allows 255, but macOS caps the whole name at 31 bytes including the leading
+/// slash (`PSHMNAMLEN`), and anything longer is refused with `ENAMETOOLONG`.
+/// Measured on macos 15.
 ///
-/// `serial` is not the kitty image id — see [`transmit_shm`] for why the two must
-/// not be conflated. `pub(crate)` so the shared-memory probe in
-/// [`crate::picker::cap_parser`] can name its own object the same way a real
-/// transmit does, without going through the display escape [`transmit_shm`]
-/// builds around it (the probe's query escape is a different shape).
+/// We cannot re-use the image ID, since all we really do is return some ratatui
+/// buffers, and it is quite probable that the terminal is still reading the SMO
+/// while we would write a resized (or otherwise updated) image to the same file.
+///
+/// Generates a 16 byte (128 bit) random number, encodes as base64, which fits well
+/// into the macos 31 byte filename length limitation, including the "/rtui-" prefix.
 #[cfg(not(windows))]
-pub(crate) fn shm_name(shm_pid: u32, serial: u32) -> String {
-    format!("/rtui-{shm_pid}-{serial}")
+pub(crate) fn generate_shm_name() -> String {
+    let bytes: [u8; 16] = rand::random();
+    let filename = format!(
+        "/rtui-{}",
+        base64_simd::URL_SAFE_NO_PAD.encode_to_string(bytes)
+    );
+    debug_assert!(filename.len() <= 31);
+    filename
 }
 
 /// Transmit via POSIX shared memory object (t=s).
@@ -361,34 +358,9 @@ pub(crate) fn shm_name(shm_pid: u32, serial: u32) -> String {
 /// a threaded caller, say), that object is left for the caller to clean up by hand,
 /// the same way an untransmitted base64 image is left marked transmitted but never
 /// shown.
-///
-/// **The object is named from a per-transmit random suffix, never from the kitty
-/// image id, and never from a second counter either.** `id` is stable across
-/// re-transmits of the same picture — deliberately, a caller such as
-/// [`StatefulKitty::resize_encode`] or a `new_protocol_with_id` caller reuses it
-/// exactly so a placement need not be rebuilt — but the object handover is
-/// ASYNCHRONOUS in a way the escape stream itself is not: a repeated base64
-/// transmit under one `id` is harmless, because the wire is ordered and the
-/// terminal simply replaces the image when it gets to the second one. A repeated
-/// shm NAME is not, because the terminal opens and reads that object whenever it
-/// next gets to it, independent of when the next transmit runs; naming the object
-/// after `id` would let a second transmit recreate (`O_CREAT|O_TRUNC`) the very
-/// object the terminal may still be midway through reading for the first one, so
-/// it finds truncated bytes, the wrong frame's bytes, or nothing at all (Ghostty
-/// answers with "shared memory size too small" and drops the frame). `rand::random`
-/// serves the suffix precisely because [`crate::picker::Picker`] already draws
-/// kitty image ids the same way — no second atomic earns its keep for one more
-/// number in the same space.
 #[cfg(not(windows))]
-fn transmit_shm(
-    bytes: &[u8],
-    w: u32,
-    h: u32,
-    id: u32,
-    shm_pid: u32,
-    is_tmux: bool,
-) -> Result<String> {
-    let shm_name = shm_name(shm_pid, random());
+fn transmit_shm(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool) -> Result<String> {
+    let shm_name = generate_shm_name();
     shm_write(&shm_name, bytes)?;
 
     let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
@@ -1033,27 +1005,6 @@ mod tests {
         assert_eq!(out, *raw.as_raw());
     }
 
-    /// macOS refuses a shared memory name longer than 31 bytes, and a refused
-    /// transmit draws nothing rather than saying so — so the widest name the
-    /// scheme can produce has to fit, not merely a typical one. The serial is a
-    /// `u32` exactly so this stays true: a `u64` serial's widest value would blow
-    /// the budget the pid alone already spends most of.
-    #[test]
-    #[cfg(not(windows))]
-    fn shm_names_fit_the_tightest_platform_limit() {
-        const PSHMNAMLEN: usize = 31;
-        let widest = super::shm_name(u32::MAX, u32::MAX);
-        assert!(
-            widest.len() <= PSHMNAMLEN,
-            "`{widest}` is {} bytes, macOS allows {PSHMNAMLEN}",
-            widest.len()
-        );
-        assert!(
-            widest.starts_with('/') && !widest[1..].contains('/'),
-            "one leading slash and no others, for portability: {widest}"
-        );
-    }
-
     /// Two transmits of the SAME image id must still land in two different
     /// objects — that is the entire fix: the terminal owns the first object
     /// asynchronously from the moment its escape is written, and a second
@@ -1064,10 +1015,9 @@ mod tests {
     fn consecutive_shm_transmits_of_the_same_id_use_different_objects() {
         let img = canvas();
         let raw = img.to_rgba8();
-        let pid = std::process::id();
-        let first = super::transmit_shm(raw.as_raw(), img.width(), img.height(), 7, pid, false)
+        let first = super::transmit_shm(raw.as_raw(), img.width(), img.height(), 7, false)
             .expect("this platform writes shared memory");
-        let second = super::transmit_shm(raw.as_raw(), img.width(), img.height(), 7, pid, false)
+        let second = super::transmit_shm(raw.as_raw(), img.width(), img.height(), 7, false)
             .expect("this platform writes shared memory");
 
         let name_of = |seq: &str| {

@@ -60,34 +60,33 @@ pub struct QueryStdioOptions {
     /// Probe POSIX shared memory objects for kitty image transmission instead of inline base64,
     /// and use it if available.
     ///
-    /// The integer is included in the SHM name (typically the process PID) to make it unique
-    /// across processes. The stdio query writes a one-pixel object under that name and asks the
-    /// terminal to read it back with the protocol's own query action (`a=q`); a terminal running
-    /// on another machine — over ssh, most obviously — cannot open it, so
-    /// [`crate::picker::Capability::KittySharedMemory`] is reported only where the terminal
-    /// answered `OK`. From then on, real images are written to a freshly named SHM object per
-    /// transmission before the kitty escape sequence is emitted, using transmission medium `t=s`.
+    /// The SHM filename is a 128 bit random number, which fits in 22 Base64 characters.
+    /// This is below macos' 31 byte filename limit.
     ///
-    /// **Shared memory is used only when that probe answered `OK`, never otherwise.** No answer —
-    /// a terminal that ignores `a=q`, one that never receives the kitty query at all (the
-    /// blacklisted protocols), an object that could not be created — means inline base64,
-    /// exactly as if this field were `None`. tmux is not one of those cases: the query already
-    /// travels through its passthrough, so the probe reaches the outer terminal. "Could not probe"
-    /// and "the terminal cannot open our memory" are indistinguishable from this side, and the
-    /// second is the ssh case, where an unprobed `t=s` transmit draws nothing at all; so there is
-    /// deliberately no fallback to using the object unprobed.
+    /// The stdio query writes a one-pixel object under that name and asks the terminal to read it
+    /// back with the protocol's own query action (`a=q`).
+    ///
+    /// [`crate::picker::Capability::KittySharedMemory`] is reported only where the terminal
+    /// answered `OK`.
     ///
     /// See <https://sw.kovidgoyal.net/kitty/graphics-protocol/#the-transmission-medium>.
     ///
-    /// The probe's own object is unlinked once its replies are read, regardless of the terminal's
-    /// answer. For a real transmit, no cleanup is performed on this side beyond that — kitty is
-    /// responsible for unlinking it after reading. An image transmit the caller never consumes
-    /// with a render (dropped frames in a threaded caller, say) leaves its object behind to be
-    /// cleaned up by hand, the same way an untransmitted base64 image is left marked transmitted
-    /// but never shown.
+    /// The probe's own object is unlinked with a drop guard once its replies are read, regardless
+    /// of the terminal's answer or behaviour.
+    /// For a successful transmit, this is a no-op. If the terminal didn't unlink it, then it also
+    /// should not have read it back.
     ///
-    /// Windows accepts the option and never reports the capability.
-    pub kitty_shared_memory_object: Option<u32>,
+    /// The filename scheme is defined at [`crate::protocol::kitty::shm_name`].
+    pub kitty_shared_memory_object: Option<String>,
+}
+
+impl QueryStdioOptions {
+    /// Public wrapper around [`crate::protocol::kitty::shm_name`].
+    /// Used to configure [`QueryStdioOptions::kitty_shared_memory_object`].
+    pub fn probe_kitty_smo() -> Option<String> {
+        let filename = crate::protocol::kitty::generate_shm_name();
+        Some(filename)
+    }
 }
 
 impl Default for QueryStdioOptions {
@@ -130,18 +129,11 @@ impl Parser {
         }
     }
 
-    /// Build the stdio query. Returns the query itself, and — where
-    /// [`QueryStdioOptions::kitty_shared_memory_object`] led to a real probe object being
-    /// created — that object's name, so the caller can unlink it once the query's replies have
-    /// been read (see [`QueryStdioOptions::kitty_shared_memory_object`]'s doc for why this side
-    /// must clean it up rather than leaving it to the terminal).
-    pub fn query(is_tmux: bool, options: QueryStdioOptions) -> (String, Option<String>) {
+    pub fn query(is_tmux: bool, options: QueryStdioOptions) -> String {
         let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
 
         let mut buf = String::with_capacity(100);
         buf.push_str(start);
-
-        let mut shm_probe_name = None;
 
         if !options.blacklist_protocols.contains(&ProtocolType::Kitty) {
             // Kitty graphics
@@ -160,25 +152,21 @@ impl Parser {
                 .unwrap();
             }
 
-            // Kitty shared memory transmission: probed by writing the SAME one RGBA
+            // Kitty shared memory transmission: probed by writing the same one RGBA
             // pixel a real `t=s` transmit would, through the same two primitives
-            // (`kitty::shm_name` + `kitty::shm_write`) a real transmit uses — not
+            // (`kitty::shm_name` + `kitty::shm_write`) a real transmit uses - not
             // `kitty::transmit_shm` itself, since that builds a real `a=T` display
             // escape and this probe needs the protocol's own `a=q` query shape
-            // wrapped around the same object instead. Its own image id (33) tells
-            // the reply apart from the others, and the payload is the object's NAME
-            // rather than its contents. A successful reply adds `KittySharedMemory`
-            // to the capabilities; the object itself is unlinked by the caller once
-            // the query's replies are read.
+            // wrapped around the same object instead.
+            // A successful reply adds `KittySharedMemory` to the capabilities.
+            // The SMO itself is unlinked by the caller or the terminal.
             #[cfg(not(windows))]
-            if let Some(shm_id) = options.kitty_shared_memory_object {
+            if let Some(filename) = options.kitty_shared_memory_object {
                 const PIXEL: [u8; 4] = [0, 0, 0, 0];
-                let name = crate::protocol::kitty::shm_name(shm_id, rand::random());
-                if crate::protocol::kitty::shm_write(&name, &PIXEL).is_ok() {
+                if crate::protocol::kitty::shm_write(&filename, &PIXEL).is_ok() {
                     write!(buf, "{escape}_Gi=33,s=1,v=1,a=q,t=s,f=32;").unwrap();
-                    base64_simd::STANDARD.encode_append(name.as_bytes(), &mut buf);
+                    base64_simd::STANDARD.encode_append(filename.as_bytes(), &mut buf);
                     write!(buf, "{escape}\\").unwrap();
-                    shm_probe_name = Some(name);
                 }
             }
         }
@@ -221,7 +209,7 @@ impl Parser {
         write!(buf, "{escape}[5n").unwrap();
 
         write!(buf, "{end}").unwrap();
-        (buf, shm_probe_name)
+        buf
     }
 
     pub fn push(&mut self, next: char) -> Vec<Response> {
@@ -430,7 +418,7 @@ mod tests {
     /// ever appear where the probe was sent.
     #[test]
     fn test_query_omits_compression_probe_by_default() {
-        let (q, _) = Parser::query(false, QueryStdioOptions::default());
+        let q = Parser::query(false, QueryStdioOptions::default());
         assert!(
             !q.contains("_Gi=32"),
             "the compression probe must be opt-in: {q}"
@@ -442,7 +430,7 @@ mod tests {
     /// but cannot inflate would drop every compressed image on the floor.
     #[test]
     fn test_query_carries_a_compressed_probe_when_opted_in() {
-        let (q, _) = Parser::query(
+        let q = Parser::query(
             false,
             QueryStdioOptions {
                 kitty_compression: true,
@@ -493,12 +481,11 @@ mod tests {
     /// sent, and no object is created to clean up either.
     #[test]
     fn test_query_omits_shared_memory_probe_by_default() {
-        let (q, name) = Parser::query(false, QueryStdioOptions::default());
+        let q = Parser::query(false, QueryStdioOptions::default());
         assert!(
             !q.contains("_Gi=33"),
             "the shared memory probe must be opt-in: {q}"
         );
-        assert_eq!(name, None, "nothing was created, so nothing to clean up");
     }
 
     /// The shared memory probe is the kitty probe with `t=s`, and its payload is
@@ -510,15 +497,17 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn test_query_shared_memory_probe_writes_a_real_object_for_cleanup() {
-        let pid = std::process::id();
-        let (q, name) = Parser::query(
+        let probe =
+            QueryStdioOptions::probe_kitty_smo().expect("this platform writes shared memory");
+        let name = probe.clone();
+
+        let q = Parser::query(
             false,
             QueryStdioOptions {
-                kitty_shared_memory_object: Some(pid),
+                kitty_shared_memory_object: Some(probe),
                 ..Default::default()
             },
         );
-        let name = name.expect("this platform writes shared memory");
 
         let (_, rest) = q
             .split_once("\x1b_Gi=33,s=1,v=1,a=q,t=s,f=32;")
@@ -533,7 +522,7 @@ mod tests {
             "the escape names the exact object this call created"
         );
         assert!(
-            name.starts_with(&format!("/rtui-{pid}-")),
+            name.starts_with("/rtui-"),
             "the same prefix a real transmit uses: {name}"
         );
 
