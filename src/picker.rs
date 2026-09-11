@@ -570,11 +570,8 @@ fn poll_and_parse(timeout_ms: i32) -> Result<Vec<Response>> {
     let mut responses = vec![];
     loop {
         let mut charbuf: [u8; 50] = [0; 50];
-        let read = match poll_stdin(timeout_ms, &mut charbuf) {
-            Ok(n) => n,
-            Err(e) => return Err(e),
-        };
-        for ch in charbuf.iter().take(read) {
+        let read_count = poll_stdin(timeout_ms, &mut charbuf)?;
+        for ch in charbuf.iter().take(read_count) {
             let mut more_caps = parser.push(char::from(*ch));
             match more_caps[..] {
                 [Response::Status] => return Ok(responses),
