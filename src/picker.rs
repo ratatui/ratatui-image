@@ -625,16 +625,54 @@ fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; 50]) -> Result<usize> {
 
 #[cfg(windows)]
 fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; 50]) -> Result<usize> {
-    use windows::Win32::Foundation::WAIT_TIMEOUT;
-    use windows::Win32::System::Console::GetStdHandle;
-    use windows::Win32::System::Console::STD_INPUT_HANDLE;
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, WAIT_TIMEOUT};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{INPUT_RECORD, KEY_EVENT, ReadConsoleInputA};
     use windows::Win32::System::Threading::WaitForSingleObject;
-    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
-    let result = unsafe { WaitForSingleObject(handle, timeout_ms as u32) };
-    if result == WAIT_TIMEOUT {
-        return Err(Errors::NoStdinResponse);
+    use windows::core::PCWSTR;
+
+    let utf16: Vec<u16> = "CONIN$\0".encode_utf16().collect();
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(utf16.as_ptr()),
+            (GENERIC_READ | GENERIC_WRITE).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )?
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+
+    loop {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u32;
+        if remaining == 0 {
+            return Err(Errors::NoStdinResponse);
+        }
+        if unsafe { WaitForSingleObject(handle, remaining) } == WAIT_TIMEOUT {
+            return Err(Errors::NoStdinResponse);
+        }
+        let mut record = INPUT_RECORD::default();
+        let mut count = 0u32;
+        unsafe { ReadConsoleInputA(handle, &mut record, 1, &mut count)? };
+        if count == 0 {
+            continue;
+        }
+        if record.EventType as u32 == KEY_EVENT
+            && unsafe { record.Event.KeyEvent.bKeyDown.as_bool() }
+        {
+            charbuf[0] = unsafe { record.Event.KeyEvent.uChar.AsciiChar.0 as u8 };
+            return Ok(1);
+        }
+        // Non-key event or key-up: discard and loop with remaining timeout.
     }
-    Ok((&io::stdin()).read(charbuf)?)
 }
 
 #[cfg(test)]
