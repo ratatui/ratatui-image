@@ -43,14 +43,8 @@ pub enum Capability {
     /// by default and you probably want it off. See that field's doc for
     /// when it's worth turning on.
     KittyCompression,
-    /// Reports being able to read a kitty transmission from a POSIX shared memory
-    /// object (`t=s`), which only a terminal on this machine can do.
-    ///
-    /// Probed for, and so only ever present, whenever
-    /// [`cap_parser::QueryStdioOptions::kitty_shared_memory_object`] is set: the
-    /// stdio query itself writes a real object and asks the terminal to read it
-    /// back, and [`Picker`] uses shared memory for its own transmissions only
-    /// where this capability is present.
+    /// A kitty image has been transmitted as a POSIX shared-memory-object,
+    /// and the terminal has unlinked it, signaling reception.
     KittySharedMemory,
     /// Reports font size in pixels.
     CellSize(Option<(u16, u16)>),
@@ -69,7 +63,6 @@ pub struct Picker {
     background_color: Option<Rgba<u8>>,
     pub(crate) is_tmux: bool,
     capabilities: Vec<Capability>,
-    kitty_shm: Option<u32>,
 }
 
 /// Serde-friendly protocol-type enum for [Picker].
@@ -122,24 +115,27 @@ impl Picker {
     /// The result can be checked by searching for [Capability::TextSizingProtocol] in [Picker::capabilities].
     ///
     /// [Text Sizing Protocol] <https://sw.kovidgoyal.net/kitty/text-sizing-protocol//>
-    pub fn from_query_stdio_with_options(options: QueryStdioOptions) -> Result<Self> {
+    pub fn from_query_stdio_with_options(mut options: QueryStdioOptions) -> Result<Self> {
         // Detect tmux, and only if positive then take some risky guess for iTerm2 support.
         let (is_tmux, tmux_proto) = detect_tmux_and_outer_protocol_from_env();
 
-        let kitty_shm = options.kitty_shared_memory_object;
-        let mut options_with_blacklist = options;
+        // Kitty SMO drop guard, unlinks the SMO file if not cleared by terminal.
+        let _kitty_smo_drop_guard = options
+            .kitty_shared_memory_object
+            .as_ref()
+            .map(|smo_filename| KittySmoProbeGuard(smo_filename.clone()));
+
         let is_wezterm = env::var("WEZTERM_EXECUTABLE").is_ok_and(|s| !s.is_empty());
         let is_konsole = env::var("KONSOLE_VERSION").is_ok_and(|s| !s.is_empty());
         if is_wezterm || is_konsole {
             // WezTerm could use Sixel, but iTerm2 (detected later is better).
             // Konsole's Sixel implementation is buggy: https://github.com/ratatui/ratatui-image?tab=readme-ov-file#compatibility-matrix
             // Neither implement the placeholder part of kitty correctly.
-            options_with_blacklist.blacklist_protocols =
-                vec![ProtocolType::Kitty, ProtocolType::Sixel];
+            options.blacklist_protocols = vec![ProtocolType::Kitty, ProtocolType::Sixel];
         }
 
         // Write and read to stdin to query protocol capabilities and font-size.
-        match query_with_timeout(is_tmux, options_with_blacklist) {
+        match query_with_timeout(is_tmux, options) {
             Ok((capability_proto, font_size, caps)) => {
                 let iterm2_proto = iterm2_from_env();
 
@@ -150,11 +146,6 @@ impl Picker {
                     .or(iterm2_proto)
                     .unwrap_or(ProtocolType::Halfblocks);
 
-                let kitty_shm = if caps.contains(&Capability::KittySharedMemory) {
-                    kitty_shm
-                } else {
-                    None
-                };
                 if let Some(font_size) = font_size {
                     Ok(Self {
                         font_size,
@@ -162,12 +153,10 @@ impl Picker {
                         protocol_type,
                         is_tmux,
                         capabilities: caps,
-                        kitty_shm,
                     })
                 } else {
                     let mut p = DEFAULT_PICKER.clone();
                     p.is_tmux = is_tmux;
-                    p.kitty_shm = kitty_shm;
                     Ok(p)
                 }
             }
@@ -176,14 +165,11 @@ impl Picker {
             // happens for example on Windows ConPTY, which does not reliably deliver the
             // responses to the child process.
             Err(Errors::NoCap | Errors::NoStdinResponse | Errors::NoFontSize) => {
-                let mut p = fallback_picker(
+                Ok(fallback_picker(
                     is_tmux,
                     tmux_proto.or_else(iterm2_from_env),
                     font_size_fallback(),
-                );
-                // Nothing answered at all, so no capability was reported.
-                p.kitty_shm = None;
-                Ok(p)
+                ))
             }
             Err(err) => Err(err),
         }
@@ -207,7 +193,6 @@ impl Picker {
             protocol_type: ProtocolType::Halfblocks,
             is_tmux,
             capabilities: Vec::new(),
-            kitty_shm: None,
         }
     }
 
@@ -233,7 +218,6 @@ impl Picker {
             protocol_type,
             is_tmux,
             capabilities: Vec::new(),
-            kitty_shm: None,
         }
     }
 
@@ -284,7 +268,7 @@ impl Picker {
                 rand::random(),
                 self.is_tmux,
                 self.capabilities.contains(&Capability::KittyCompression),
-                self.kitty_shm,
+                self.capabilities.contains(&Capability::KittySharedMemory),
             )?)),
             ProtocolType::Iterm2 => Ok(Protocol::ITerm2(Iterm2::new(image, size, self.is_tmux)?)),
         }
@@ -323,7 +307,7 @@ impl Picker {
                 random(),
                 self.is_tmux,
                 self.capabilities.contains(&Capability::KittyCompression),
-                self.kitty_shm,
+                self.capabilities.contains(&Capability::KittySharedMemory),
             )),
             ProtocolType::Iterm2 => StatefulProtocolType::ITerm2(Iterm2 {
                 is_tmux: self.is_tmux,
@@ -343,7 +327,6 @@ static DEFAULT_PICKER: Picker = Picker {
     protocol_type: ProtocolType::Halfblocks,
     is_tmux: false,
     capabilities: Vec::new(),
-    kitty_shm: None,
 };
 
 /// Build a picker from whatever could be detected without the terminal answering the query.
@@ -521,17 +504,7 @@ fn query_stdio_capabilities(
     // `[1337n`: iTerm2 (some terminals implement the protocol but sadly not this custom CSI)
     // `[5n`: Device Status Report, implemented by all terminals, ensure that there is some
     // response and we don't hang reading forever.
-    let (query, shm_probe_name) = Parser::query(is_tmux, options);
-    // `Parser::query` already wrote the shared memory probe's object (if any) before
-    // naming it in the query, since the terminal must be able to open it the moment
-    // it reads the escape. Kitty/Ghostty unlink it themselves once they've read it,
-    // so this guard is for every other outcome — ignored, refused, or never
-    // answered — which would otherwise leave it behind for the life of the machine.
-    #[cfg(not(windows))]
-    let _unlink_shm_probe = shm_probe_name.map(ShmProbeUnlink);
-    #[cfg(windows)]
-    let _ = shm_probe_name;
-
+    let query = Parser::query(is_tmux, options);
     io::stdout().write_all(query.as_bytes())?;
     io::stdout().flush()?;
 
@@ -560,24 +533,6 @@ fn query_stdio_capabilities(
     tx.send(QueryResult::Done(result))
         .map_err(|_senderr| Errors::NoStdinResponse)?;
     Ok(())
-}
-
-/// Unlinks the named shared memory object when dropped.
-///
-/// `Parser::query` writes and names the shared-memory probe's object before this
-/// side ever sees the terminal's answer, so cleanup lives here rather than in the
-/// query builder: kitty/Ghostty unlink an object once they've read it, so a gone
-/// object at drop time is the success case, not an error (`ENOENT` is ignored) —
-/// this guard exists for every other outcome, where the terminal ignored,
-/// refused, or never answered the probe at all.
-#[cfg(not(windows))]
-struct ShmProbeUnlink(String);
-
-#[cfg(not(windows))]
-impl Drop for ShmProbeUnlink {
-    fn drop(&mut self) {
-        let _ = rustix::shm::unlink(self.0.as_str());
-    }
 }
 
 fn interpret_parser_responses(
@@ -698,6 +653,13 @@ fn query_with_timeout(
     }
 }
 
+struct KittySmoProbeGuard(String);
+impl Drop for KittySmoProbeGuard {
+    fn drop(&mut self) {
+        let _ = rustix::shm::unlink(self.0.as_str());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::assert_eq;
@@ -709,25 +671,28 @@ mod tests {
 
     use super::{cap_parser::Response, fallback_picker, interpret_parser_responses};
 
-    /// Exercises the query-side probe end to end: `Parser::query` writes a real
-    /// object and names it in the escape, and `ShmProbeUnlink` — the guard
-    /// `query_stdio_capabilities` wraps the name in — is what's responsible for
-    /// cleaning it up afterward. The object has to actually exist while the
-    /// guard is alive and actually be gone once it drops, not just the string
-    /// plumbing between the two.
+    /// Exercises the probe end to end: `Parser::query` writes a real object and
+    /// names it in the escape, and `KittySmoProbeGuard` — which `Picker` uses to
+    /// wrap the probe while waiting for replies — must clean it up on drop. The
+    /// object has to actually exist while the guard is alive and actually be gone
+    /// once it drops, not just the string plumbing between the two.
     #[test]
     #[cfg(not(windows))]
     fn test_shm_probe_round_trips() {
-        use super::ShmProbeUnlink;
+        use crate::picker::KittySmoProbeGuard;
 
-        let (_query, name) = super::cap_parser::Parser::query(
+        let name =
+            QueryStdioOptions::probe_kitty_smo().expect("this platform writes shared memory");
+
+        // Parser::query is what actually writes the SHM object with that name.
+        let _ = super::cap_parser::Parser::query(
             false,
             QueryStdioOptions {
-                kitty_shared_memory_object: Some(std::process::id()),
+                kitty_shared_memory_object: Some(name.clone()),
                 ..Default::default()
             },
         );
-        let name = name.expect("this platform writes shared memory");
+        let _guard = KittySmoProbeGuard(name.clone());
 
         let fd = rustix::shm::open(
             name.as_str(),
@@ -746,7 +711,7 @@ mod tests {
         );
         drop(fd);
 
-        drop(ShmProbeUnlink(name.clone()));
+        drop(_guard);
         assert!(
             rustix::shm::open(
                 name.as_str(),
