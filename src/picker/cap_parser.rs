@@ -1,5 +1,5 @@
 //! Terminal stdio query parser module.
-use std::{fmt::Write, time::Duration};
+use std::fmt::Write;
 
 use crate::picker::{ProtocolType, STDIN_READ_TIMEOUT_MILLIS};
 
@@ -31,8 +31,8 @@ pub enum Response {
 
 /// Extra query options
 pub struct QueryStdioOptions {
-    /// Timeout for the stdio query.
-    pub timeout: Duration,
+    /// Timeout for the stdio query in milliseconds.
+    pub timeout_ms: i32,
     /// Query for [Text Sizing Protocol]. The result can be checked by searching for
     /// [crate::picker::Capability::TextSizingProtocol] in [crate::picker::Picker::capabilities].
     ///
@@ -93,7 +93,7 @@ impl QueryStdioOptions {
 impl Default for QueryStdioOptions {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_millis(STDIN_READ_TIMEOUT_MILLIS),
+            timeout_ms: STDIN_READ_TIMEOUT_MILLIS,
             text_sizing_protocol: false,
             terminal_background_color_osc: false,
             blacklist_protocols: Vec::new(),
