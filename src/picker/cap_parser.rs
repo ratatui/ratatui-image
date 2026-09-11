@@ -83,6 +83,7 @@ pub struct QueryStdioOptions {
 impl QueryStdioOptions {
     /// Public wrapper around [`crate::protocol::kitty::shm_name`].
     /// Used to configure [`QueryStdioOptions::kitty_shared_memory_object`].
+    #[cfg(not(windows))]
     pub fn probe_kitty_smo() -> Option<String> {
         let filename = crate::protocol::kitty::generate_shm_name();
         Some(filename)

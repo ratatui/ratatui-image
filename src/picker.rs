@@ -120,6 +120,7 @@ impl Picker {
         let (is_tmux, tmux_proto) = detect_tmux_and_outer_protocol_from_env();
 
         // Kitty SMO drop guard, unlinks the SMO file if not cleared by terminal.
+        #[cfg(not(windows))]
         let _kitty_smo_drop_guard = options
             .kitty_shared_memory_object
             .as_ref()
@@ -644,7 +645,9 @@ fn query_with_timeout(
     }
 }
 
+#[cfg(not(windows))]
 struct KittySmoProbeGuard(String);
+#[cfg(not(windows))]
 impl Drop for KittySmoProbeGuard {
     fn drop(&mut self) {
         let _ = rustix::shm::unlink(self.0.as_str());
