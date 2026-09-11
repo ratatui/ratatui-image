@@ -2,7 +2,7 @@
 
 use std::{
     env,
-    io::{self, Read, Write},
+    io::{self, Write},
 };
 
 use crate::{
@@ -585,6 +585,7 @@ fn poll_and_parse(timeout_ms: i32) -> Result<Vec<Response>> {
 fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; 50]) -> Result<usize> {
     use rustix::event::{PollFd, PollFlags, poll};
     use rustix::fd::AsFd;
+    use std::io::Read;
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
     let mut pollfds = [PollFd::new(&stdin_fd, PollFlags::IN)];
@@ -633,14 +634,14 @@ fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; 50]) -> Result<usize> {
         }
         let mut record = INPUT_RECORD::default();
         let mut count = 0u32;
-        unsafe { ReadConsoleInputA(handle, &mut record, 1, &mut count)? };
+        unsafe { ReadConsoleInputA(handle, std::slice::from_mut(&mut record), &mut count)? };
         if count == 0 {
             continue;
         }
         if record.EventType as u32 == KEY_EVENT
             && unsafe { record.Event.KeyEvent.bKeyDown.as_bool() }
         {
-            charbuf[0] = unsafe { record.Event.KeyEvent.uChar.AsciiChar.0 as u8 };
+            charbuf[0] = unsafe { record.Event.KeyEvent.uChar.AsciiChar as u8 };
             return Ok(1);
         }
         // Non-key event or key-up: discard and loop with remaining timeout.
