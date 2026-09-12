@@ -140,6 +140,13 @@ impl Picker {
                     .unwrap_or(ProtocolType::Halfblocks);
 
                 if let Some(font_size) = font_size {
+                    let wsfs = font_size_fallback().unwrap();
+                    if font_size.width != wsfs.width || font_size.height != wsfs.height {
+                        eprintln!("------------------ MISMATCH!!! -------------------");
+                    }
+                    eprintln!("DCS font size: {font_size:?}");
+                    eprintln!("ioctl font size: {wsfs:?}");
+
                     Ok(Self {
                         font_size,
                         background_color: None,

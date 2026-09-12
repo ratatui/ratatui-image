@@ -13,6 +13,7 @@ use ratatui::{
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
 };
+use ratatui_image::picker::{Picker, cap_parser::QueryStdioOptions};
 
 use crate::{App, ui};
 
@@ -75,6 +76,14 @@ where
                     }
                 }
                 Event::Resize(_, _) => {
+                    let picker = Picker::from_query_stdio_with_options(QueryStdioOptions {
+                        terminal_background_color_osc: true,
+                        text_sizing_protocol: true,
+                        ..Default::default()
+                    })
+                    .unwrap();
+
+                    app.picker = picker;
                     needs_render = true;
                 }
                 _ => {}
