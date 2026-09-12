@@ -229,6 +229,15 @@ impl Picker {
         self.font_size
     }
 
+    /// Whether launch-time detection (from `TERM`/`TERM_PROGRAM`) concluded this
+    /// app is running inside tmux.
+    ///
+    /// This is a best-effort guess, not a guarantee — tmux does not announce
+    /// itself unambiguously in every configuration.
+    pub fn tmux_detected(&self) -> bool {
+        self.is_tmux
+    }
+
     /// Change the default background color (transparent black).
     pub fn set_background_color<T: Into<Rgba<u8>>>(&mut self, background_color: Option<T>) {
         self.background_color = background_color.map(Into::into);
@@ -656,6 +665,21 @@ mod tests {
         assert_eq!(proto, ProtocolType::Iterm2);
         proto = proto.next();
         assert_eq!(proto, ProtocolType::Halfblocks);
+    }
+
+    #[test]
+    fn test_tmux_detected_reflects_is_tmux() {
+        let mut picker = Picker {
+            font_size: FontSize::new(10, 20),
+            protocol_type: ProtocolType::Kitty,
+            background_color: None,
+            is_tmux: true,
+            capabilities: Vec::new(),
+        };
+        assert!(picker.tmux_detected());
+
+        picker.is_tmux = false;
+        assert!(!picker.tmux_detected());
     }
 
     #[test]
