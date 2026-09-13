@@ -324,7 +324,7 @@ mod sixel_slice {
             let bands: Vec<&str> = self.bands.to_vec();
             let take_bands = ((self.size.height.saturating_sub(drop_line_count as u16)) as usize
                 * self.font_height as usize)
-                .div_ceil(6);
+                / 6;
 
             let sliced_bands: Vec<&str> = bands
                 .iter()
@@ -607,8 +607,8 @@ mod sixel_slice {
             // ceil(225 / 6) = 38, full image, no matter what font-size
             assert_eq!(38, sliced.bands(0, 0).len());
 
-            // one row is 20px, ceil(20/6) = 4 bands
-            assert_eq!(4, sliced.bands(0, 11).len());
+            // one row is 20px, 20/6 = 3 bands
+            assert_eq!(3, sliced.bands(0, 11).len());
         }
     }
 }
