@@ -22,6 +22,7 @@ pub enum Response {
     Sixel,
     RectangularOps,
     KittyCompression,
+    KittySharedMemory,
     CellSize(Option<(u16, u16)>),
     CursorPositionReport(u16, u16),
     Background(u8, u8, u8),
@@ -56,6 +57,37 @@ pub struct QueryStdioOptions {
     /// bottleneck, such as over SSH, and the images compress well (flat
     /// colour, UI, pixel art).
     pub kitty_compression: bool,
+    /// Probe POSIX shared memory objects for kitty image transmission instead of inline base64,
+    /// and use it if available.
+    ///
+    /// The SHM filename is a 128 bit random number, which fits in 22 Base64 characters.
+    /// This is below macos' 31 byte filename limit.
+    ///
+    /// The stdio query writes a one-pixel object under that name and asks the terminal to read it
+    /// back with the protocol's own query action (`a=q`).
+    ///
+    /// [`crate::picker::Capability::KittySharedMemory`] is reported only where the terminal
+    /// answered `OK`.
+    ///
+    /// See <https://sw.kovidgoyal.net/kitty/graphics-protocol/#the-transmission-medium>.
+    ///
+    /// The probe's own object is unlinked with a drop guard once its replies are read, regardless
+    /// of the terminal's answer or behaviour.
+    /// For a successful transmit, this is a no-op. If the terminal didn't unlink it, then it also
+    /// should not have read it back.
+    ///
+    /// The filename scheme is defined at [`crate::protocol::kitty::shm_name`].
+    pub kitty_shared_memory_object: Option<String>,
+}
+
+impl QueryStdioOptions {
+    /// Public wrapper around [`crate::protocol::kitty::shm_name`].
+    /// Used to configure [`QueryStdioOptions::kitty_shared_memory_object`].
+    #[cfg(not(windows))]
+    pub fn probe_kitty_smo() -> Option<String> {
+        let filename = crate::protocol::kitty::generate_shm_name();
+        Some(filename)
+    }
 }
 
 impl Default for QueryStdioOptions {
@@ -66,6 +98,7 @@ impl Default for QueryStdioOptions {
             terminal_background_color_osc: false,
             blacklist_protocols: Vec::new(),
             kitty_compression: false,
+            kitty_shared_memory_object: None,
         }
     }
 }
@@ -119,6 +152,24 @@ impl Parser {
                 )
                 .unwrap();
             }
+
+            // Kitty shared memory transmission: probed by writing the same one RGBA
+            // pixel a real `t=s` transmit would, through the same two primitives
+            // (`kitty::shm_name` + `kitty::shm_write`) a real transmit uses - not
+            // `kitty::transmit_shm` itself, since that builds a real `a=T` display
+            // escape and this probe needs the protocol's own `a=q` query shape
+            // wrapped around the same object instead.
+            // A successful reply adds `KittySharedMemory` to the capabilities.
+            // The SMO itself is unlinked by the caller or the terminal.
+            #[cfg(not(windows))]
+            if let Some(filename) = options.kitty_shared_memory_object {
+                const PIXEL: [u8; 4] = [0, 0, 0, 0];
+                if crate::protocol::kitty::shm_write(&filename, &PIXEL).is_ok() {
+                    write!(buf, "{escape}_Gi=33,s=1,v=1,a=q,t=s,f=32;").unwrap();
+                    base64_simd::STANDARD.encode_append(filename.as_bytes(), &mut buf);
+                    write!(buf, "{escape}\\").unwrap();
+                }
+            }
         }
 
         if !options.blacklist_protocols.contains(&ProtocolType::Sixel) {
@@ -170,7 +221,7 @@ impl Parser {
                         // If the current sequence hasn't been identified yet, start a new one on Esc.
                         return self.restart();
                     }
-                    ("_Gi=31" | "_Gi=32", ';') => {
+                    ("_Gi=31" | "_Gi=32" | "_Gi=33", ';') => {
                         self.sequence = ResponseParseState::KittyResponse;
                     }
 
@@ -273,6 +324,7 @@ impl Parser {
                     let caps = match &self.data[..] {
                         "_Gi=31;OK\x1b" => vec![Response::Kitty],
                         "_Gi=32;OK\x1b" => vec![Response::KittyCompression],
+                        "_Gi=33;OK\x1b" => vec![Response::KittySharedMemory],
                         _ => vec![],
                     };
                     self.restart();
@@ -421,6 +473,96 @@ mod tests {
     fn test_parse_compression_refused() {
         assert_eq!(
             parse("\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;EINVAL:bad\x1b\\\x1b[0n"),
+            vec![Response::Kitty, Response::Status],
+        );
+    }
+
+    /// The shared memory probe is off by default, so
+    /// `Capability::KittySharedMemory` can only ever appear where the probe was
+    /// sent, and no object is created to clean up either.
+    #[test]
+    fn test_query_omits_shared_memory_probe_by_default() {
+        let q = Parser::query(false, QueryStdioOptions::default());
+        assert!(
+            !q.contains("_Gi=33"),
+            "the shared memory probe must be opt-in: {q}"
+        );
+    }
+
+    /// The shared memory probe is the kitty probe with `t=s`, and its payload is
+    /// the NAME of a real object this call just wrote a pixel into — not a
+    /// placeholder — rather than pixels: a terminal on another machine cannot
+    /// open it, which is the whole point of asking. `query` hands the name back
+    /// so the caller can clean it up once the replies are read (see
+    /// `QueryStdioOptions::kitty_shared_memory_object`'s doc).
+    #[test]
+    #[cfg(not(windows))]
+    fn test_query_shared_memory_probe_writes_a_real_object_for_cleanup() {
+        let probe =
+            QueryStdioOptions::probe_kitty_smo().expect("this platform writes shared memory");
+        let name = probe.clone();
+
+        let q = Parser::query(
+            false,
+            QueryStdioOptions {
+                kitty_shared_memory_object: Some(probe),
+                ..Default::default()
+            },
+        );
+
+        let (_, rest) = q
+            .split_once("\x1b_Gi=33,s=1,v=1,a=q,t=s,f=32;")
+            .expect("the shared memory probe is in the query");
+        let (payload, _) = rest.split_once("\x1b\\").expect("the probe is terminated");
+        let decoded = base64_simd::STANDARD
+            .decode_to_vec(payload)
+            .expect("the probe payload is base64");
+        let decoded = String::from_utf8(decoded).expect("the probe payload is an object name");
+        assert_eq!(
+            decoded, name,
+            "the escape names the exact object this call created"
+        );
+        assert!(
+            name.starts_with("/rtui-"),
+            "the same prefix a real transmit uses: {name}"
+        );
+
+        // The object is real, and holds the one RGBA pixel the probe promises
+        // (`f=32,s=1,v=1`) — not merely a name nothing backs.
+        let fd = rustix::shm::open(
+            name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("the query wrote the object before naming it");
+        let size = rustix::fs::fstat(&fd).expect("stat the object").st_size;
+        assert!(size >= 4, "one RGBA pixel, got {size} bytes");
+        drop(fd);
+
+        // `query` only writes; cleanup is the caller's job (`Picker` unlinks it
+        // once the query's replies are read). Play that part here.
+        rustix::shm::unlink(name.as_str()).expect("the caller can unlink what query wrote");
+    }
+
+    #[test]
+    fn test_parse_shared_memory_response() {
+        assert_eq!(
+            parse("\x1b_Gi=31;OK\x1b\\\x1b_Gi=33;OK\x1b\\\x1b[0n"),
+            vec![
+                Response::Kitty,
+                Response::KittySharedMemory,
+                Response::Status
+            ],
+        );
+    }
+
+    /// A terminal that cannot reach the object — anything remote — answers with
+    /// an error, and must yield no capability: transmitting to it anyway would
+    /// draw nothing at all.
+    #[test]
+    fn test_parse_shared_memory_refused() {
+        assert_eq!(
+            parse("\x1b_Gi=31;OK\x1b\\\x1b_Gi=33;EBADF:no such file\x1b\\\x1b[0n"),
             vec![Response::Kitty, Response::Status],
         );
     }

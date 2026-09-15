@@ -43,6 +43,9 @@ pub enum Capability {
     /// by default and you probably want it off. See that field's doc for
     /// when it's worth turning on.
     KittyCompression,
+    /// A kitty image has been transmitted as a POSIX shared-memory-object,
+    /// and the terminal has unlinked it, signaling reception.
+    KittySharedMemory,
     /// Reports font size in pixels.
     CellSize(Option<(u16, u16)>),
     /// Reports supporting text sizing protocol.
@@ -112,23 +115,28 @@ impl Picker {
     /// The result can be checked by searching for [Capability::TextSizingProtocol] in [Picker::capabilities].
     ///
     /// [Text Sizing Protocol] <https://sw.kovidgoyal.net/kitty/text-sizing-protocol//>
-    pub fn from_query_stdio_with_options(options: QueryStdioOptions) -> Result<Self> {
+    pub fn from_query_stdio_with_options(mut options: QueryStdioOptions) -> Result<Self> {
         // Detect tmux, and only if positive then take some risky guess for iTerm2 support.
         let (is_tmux, tmux_proto) = detect_tmux_and_outer_protocol_from_env();
 
-        let mut options_with_blacklist = options;
+        // Kitty SMO drop guard, unlinks the SMO file if not cleared by terminal.
+        #[cfg(not(windows))]
+        let _kitty_smo_drop_guard = options
+            .kitty_shared_memory_object
+            .as_ref()
+            .map(|smo_filename| KittySmoProbeGuard(smo_filename.clone()));
+
         let is_wezterm = env::var("WEZTERM_EXECUTABLE").is_ok_and(|s| !s.is_empty());
         let is_konsole = env::var("KONSOLE_VERSION").is_ok_and(|s| !s.is_empty());
         if is_wezterm || is_konsole {
             // WezTerm could use Sixel, but iTerm2 (detected later is better).
             // Konsole's Sixel implementation is buggy: https://github.com/ratatui/ratatui-image?tab=readme-ov-file#compatibility-matrix
             // Neither implement the placeholder part of kitty correctly.
-            options_with_blacklist.blacklist_protocols =
-                vec![ProtocolType::Kitty, ProtocolType::Sixel];
+            options.blacklist_protocols = vec![ProtocolType::Kitty, ProtocolType::Sixel];
         }
 
         // Write and read to stdin to query protocol capabilities and font-size.
-        match query_with_timeout(is_tmux, options_with_blacklist) {
+        match query_with_timeout(is_tmux, options) {
             Ok((capability_proto, font_size, caps)) => {
                 let iterm2_proto = iterm2_from_env();
 
@@ -261,6 +269,7 @@ impl Picker {
                 rand::random(),
                 self.is_tmux,
                 self.capabilities.contains(&Capability::KittyCompression),
+                self.capabilities.contains(&Capability::KittySharedMemory),
             )?)),
             ProtocolType::Iterm2 => Ok(Protocol::ITerm2(Iterm2::new(image, size, self.is_tmux)?)),
         }
@@ -299,6 +308,7 @@ impl Picker {
                 random(),
                 self.is_tmux,
                 self.capabilities.contains(&Capability::KittyCompression),
+                self.capabilities.contains(&Capability::KittySharedMemory),
             )),
             ProtocolType::Iterm2 => StatefulProtocolType::ITerm2(Iterm2 {
                 is_tmux: self.is_tmux,
@@ -554,6 +564,7 @@ fn interpret_parser_responses(
             }
             Response::RectangularOps => Some(Capability::RectangularOps),
             Response::KittyCompression => Some(Capability::KittyCompression),
+            Response::KittySharedMemory => Some(Capability::KittySharedMemory),
             Response::CellSize(cell_size) => {
                 if let Some((w, h)) = cell_size {
                     font_size = Some((*w, *h).into());
@@ -643,16 +654,77 @@ fn query_with_timeout(
     }
 }
 
+#[cfg(not(windows))]
+struct KittySmoProbeGuard(String);
+#[cfg(not(windows))]
+impl Drop for KittySmoProbeGuard {
+    fn drop(&mut self) {
+        let _ = rustix::shm::unlink(self.0.as_str());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::assert_eq;
 
     use crate::{
         FontSize,
-        picker::{Capability, Picker, ProtocolType},
+        picker::{Capability, Picker, ProtocolType, cap_parser::QueryStdioOptions},
     };
 
     use super::{cap_parser::Response, fallback_picker, interpret_parser_responses};
+
+    /// Exercises the probe end to end: `Parser::query` writes a real object and
+    /// names it in the escape, and `KittySmoProbeGuard` — which `Picker` uses to
+    /// wrap the probe while waiting for replies — must clean it up on drop. The
+    /// object has to actually exist while the guard is alive and actually be gone
+    /// once it drops, not just the string plumbing between the two.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_shm_probe_round_trips() {
+        use crate::picker::KittySmoProbeGuard;
+
+        let name =
+            QueryStdioOptions::probe_kitty_smo().expect("this platform writes shared memory");
+
+        // Parser::query is what actually writes the SHM object with that name.
+        let _ = super::cap_parser::Parser::query(
+            false,
+            QueryStdioOptions {
+                kitty_shared_memory_object: Some(name.clone()),
+                ..Default::default()
+            },
+        );
+        let _guard = KittySmoProbeGuard(name.clone());
+
+        let fd = rustix::shm::open(
+            name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("the object exists before the guard has dropped");
+        // At least the one RGBA pixel `f=32,s=1,v=1` promises, since a terminal
+        // rejects an object smaller than `s * v * bpp`. Not exactly: macOS rounds
+        // a shared memory object up to a page, so this reads 16384 there and 4 on
+        // Linux, and only the floor is a portable claim.
+        let size = rustix::fs::fstat(&fd).expect("stat the object").st_size;
+        assert!(
+            size >= 4,
+            "the probe object holds one RGBA pixel, got {size}"
+        );
+        drop(fd);
+
+        drop(_guard);
+        assert!(
+            rustix::shm::open(
+                name.as_str(),
+                rustix::shm::OFlags::RDONLY,
+                rustix::fs::Mode::empty(),
+            )
+            .is_err(),
+            "the guard leaves nothing behind for a terminal that never read it"
+        );
+    }
 
     #[test]
     fn test_cycle_protocol() {

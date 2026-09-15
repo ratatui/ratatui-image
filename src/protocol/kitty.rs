@@ -10,6 +10,14 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(any(windows, target_os = "linux")))]
+use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
+#[cfg(not(windows))]
+use rustix::{
+    fs::Mode,
+    shm::{self, OFlags as ShmOFlags},
+};
+
 use crate::protocol::UNIT_WIDTH;
 use crate::{Result, picker::cap_parser::Parser};
 use image::DynamicImage;
@@ -30,14 +38,26 @@ struct KittyProtoState {
 }
 
 impl KittyProtoState {
-    fn new(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool) -> Self {
-        let transmit_str = transmit_virtual(img, id, is_tmux, compress);
+    fn new(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool, smo: bool) -> Result<Self> {
+        // The only caller that holds a `DynamicImage`: every transmit path below
+        // takes raw RGBA bytes plus dimensions, so the conversion happens once,
+        // here, rather than once per path.
+        let img_rgba8 = img.to_rgba8();
+        let transmit_str = transmit_or_shm(
+            img_rgba8.as_raw(),
+            img.width(),
+            img.height(),
+            id,
+            is_tmux,
+            compress,
+            smo,
+        )?;
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
-        Self {
+        Ok(Self {
             transmitted: Arc::new(AtomicBool::new(false)),
             transmit_str: Some(transmit_str),
             id: (id, Color::Rgb(id_r, id_g, id_b), u16::from(id_extra)),
-        }
+        })
     }
 
     // Produce the transmit sequence or None if it has already been produced before.
@@ -65,8 +85,9 @@ impl Kitty {
         id: u32,
         is_tmux: bool,
         compress: bool,
+        smo: bool,
     ) -> Result<Self> {
-        let proto_state = KittyProtoState::new(&image, id, is_tmux, compress);
+        let proto_state = KittyProtoState::new(&image, id, is_tmux, compress, smo)?;
         Ok(Self { proto_state, size })
     }
 
@@ -106,10 +127,11 @@ pub struct StatefulKitty {
     proto_state: KittyProtoState,
     is_tmux: bool,
     compress: bool,
+    smo: bool,
 }
 
 impl StatefulKitty {
-    pub fn new(id: u32, is_tmux: bool, compress: bool) -> StatefulKitty {
+    pub fn new(id: u32, is_tmux: bool, compress: bool, smo: bool) -> StatefulKitty {
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         StatefulKitty {
             id: (id, Color::Rgb(id_r, id_g, id_b), u16::from(id_extra)),
@@ -117,6 +139,7 @@ impl StatefulKitty {
             proto_state: KittyProtoState::default(),
             is_tmux,
             compress,
+            smo,
         }
     }
 }
@@ -138,7 +161,8 @@ impl StatefulProtocolTrait for StatefulKitty {
     fn resize_encode(&mut self, img: DynamicImage, size: Size) -> Result<()> {
         self.size = size;
         // If resized then we must transmit again.
-        self.proto_state = KittyProtoState::new(&img, self.id.0, self.is_tmux, self.compress);
+        self.proto_state =
+            KittyProtoState::new(&img, self.id.0, self.is_tmux, self.compress, self.smo)?;
         Ok(())
     }
 }
@@ -205,6 +229,159 @@ fn zlib(raw: &[u8]) -> Vec<u8> {
     enc.finish().expect("zlib encoder writing into a Vec")
 }
 
+#[cfg_attr(windows, allow(unused_variables))]
+fn transmit_or_shm(
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+    id: u32,
+    is_tmux: bool,
+    compress: bool,
+    smo: bool,
+) -> Result<String> {
+    #[cfg(not(windows))]
+    if smo {
+        return transmit_shm(bytes, w, h, id, is_tmux);
+    }
+    Ok(transmit_base64(bytes, w, h, id, is_tmux, compress))
+}
+
+/// Create a shared memory object.
+///
+/// **Linux writes through the descriptor.** `write(2)` on a POSIX shared memory
+/// object allocates the `tmpfs` pages it touches inside the syscall itself —
+/// unlike `ftruncate`, which only names a length and lets `tmpfs` allocate on
+/// first touch — so there is nothing to reserve up front and no mapping to make:
+/// an object bigger than the space left in `/dev/shm` (64 MB by default in a
+/// Docker container) answers `write_all` with an ordinary `io::Error` — `ENOSPC`,
+/// or a short write — which the caller already turns into a fallback like any
+/// other failure. `ftruncate` is unnecessary too, since the write itself sets the
+/// object's length. `shm::open` hands back an `OwnedFd`, and `File`'s `From`
+/// impl for it needs no `unsafe` at all.
+///
+/// The object still ends up sized to exactly the payload — a terminal rejects one
+/// smaller than `s * v * bpp` (Ghostty: "shared memory size too small") — which
+/// falls out of writing exactly `bytes.len()` bytes to a fresh object.
+///
+/// Linux is the one target with its own function because it is the one target
+/// where mapping a shared memory object can fail at runtime instead of at open
+/// time: a mapping that outruns a `tmpfs` short on pages faults with `SIGBUS` on
+/// first touch, past any `Result` this crate could hand back. `write(2)` turns
+/// the same shortage into an ordinary `io::Error` instead, so Linux writes and
+/// every other Unix maps (see this function's twin below).
+#[cfg(target_os = "linux")]
+pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    let fd = shm::open(
+        name,
+        ShmOFlags::CREATE | ShmOFlags::RDWR | ShmOFlags::TRUNC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    std::fs::File::from(fd).write_all(bytes)?;
+    Ok(())
+}
+
+/// Create a shared memory object of exactly `bytes.len()` and fill it.
+///
+/// **Every non-Linux Unix goes in through a mapping instead of `write(2)`.**
+/// `mmap` is the one operation POSIX actually promises on a shared memory
+/// object; `write` is a per-kernel courtesy on top of it, and this crate has
+/// already met both ends of that: macOS refuses it outright with `ENXIO`
+/// (there is no read/write path on its shared memory objects at all), while
+/// FreeBSD happens to allow it but is untested here. Mapping is also what the
+/// terminal itself uses to read the object back, so this is the operation
+/// every reader on these platforms is already relying on. `ftruncate` alone
+/// reserves what it names — these objects are ordinary anonymous memory with
+/// no separate `tmpfs` quota to run out of the way Linux's can (see the
+/// `target_os = "linux"` twin of this function, above, for why Linux writes
+/// instead). The cfg spells "every Unix but Linux", not "macOS": the crate
+/// draws no line between the rest anywhere else, and this function shouldn't
+/// either.
+///
+/// The object is sized to exactly the payload, since a terminal rejects one
+/// smaller than `s * v * bpp` (Ghostty: "shared memory size too small").
+#[cfg(not(any(windows, target_os = "linux")))]
+pub(crate) fn shm_write(name: &str, bytes: &[u8]) -> Result<()> {
+    let fd = shm::open(
+        name,
+        ShmOFlags::CREATE | ShmOFlags::RDWR | ShmOFlags::TRUNC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    rustix::fs::ftruncate(&fd, bytes.len() as u64)?;
+    // SAFETY: a fresh mapping of a descriptor we just created and sized to
+    // `bytes.len()`, written once and unmapped before it can be aliased.
+    unsafe {
+        let ptr = mmap(
+            std::ptr::null_mut(),
+            bytes.len(),
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::SHARED,
+            &fd,
+            0,
+        )?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+        munmap(ptr, bytes.len())?;
+    }
+    Ok(())
+}
+
+/// The name of the shared memory object filename: `/rtui-<16bit random base64>`.
+///
+/// POSIX defines _POSIX_NAME_MAX as 14 for filename components, but shm_open() has
+/// implementation-defined name-length limits.
+/// Linux allows 255, but macOS caps the whole name at 31 bytes including the leading
+/// slash (`PSHMNAMLEN`), and anything longer is refused with `ENAMETOOLONG`.
+/// Measured on macos 15.
+///
+/// We cannot re-use the image ID, since all we really do is return some ratatui
+/// buffers, and it is quite probable that the terminal is still reading the SMO
+/// while we would write a resized (or otherwise updated) image to the same file.
+///
+/// Generates a 16 byte (128 bit) random number, encodes as base64, which fits well
+/// into the macos 31 byte filename length limitation, including the "/rtui-" prefix.
+#[cfg(not(windows))]
+pub(crate) fn generate_shm_name() -> String {
+    let bytes: [u8; 16] = rand::random();
+    let filename = format!(
+        "/rtui-{}",
+        base64_simd::URL_SAFE_NO_PAD.encode_to_string(bytes)
+    );
+    debug_assert!(filename.len() <= 31);
+    filename
+}
+
+/// Transmit via POSIX shared memory object (t=s).
+///
+/// Writes raw RGBA pixels into a named SHM object, then emits a single kitty APC chunk
+/// pointing at it. The SHM object is intentionally left alive for kitty to unlink —
+/// and if the caller never consumes this transmit with a render (a dropped frame in
+/// a threaded caller, say), that object is left for the caller to clean up by hand,
+/// the same way an untransmitted base64 image is left marked transmitted but never
+/// shown.
+#[cfg(not(windows))]
+fn transmit_shm(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool) -> Result<String> {
+    let shm_name = generate_shm_name();
+    shm_write(&shm_name, bytes)?;
+
+    let (start, escape, end) = Parser::tmux_start_escape_end(is_tmux);
+
+    let payload_len = shm_name.len().div_ceil(3) * 4; // base64 upper bound
+    let mut data =
+        String::with_capacity(start.len() + escape.len() * 2 + 50 + payload_len + end.len());
+    data.push_str(start);
+    write!(
+        data,
+        "{escape}_Gq=2,i={id},a=T,U=1,f=32,t=s,s={w},v={h},m=0;"
+    )
+    .unwrap();
+    base64_simd::STANDARD.encode_append(shm_name.as_bytes(), &mut data);
+    write!(data, "{escape}\\").unwrap();
+    data.push_str(end);
+
+    Ok(data)
+}
+
 /// Create a kitty escape sequence for transmitting and virtual-placement.
 ///
 /// The image will be transmitted as RGBA in chunks of 4096 bytes.
@@ -223,14 +400,11 @@ fn zlib(raw: &[u8]) -> Vec<u8> {
 /// `compress` must only be set when the terminal answered the `o=z` capability
 /// probe: a terminal that cannot inflate refuses the transmission outright, and
 /// every placement naming the image then draws nothing at all.
-fn transmit_virtual(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool) -> String {
-    let (w, h) = (img.width(), img.height());
-    let img_rgba8 = img.to_rgba8();
-    let raw = img_rgba8.as_raw();
+fn transmit_base64(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool, compress: bool) -> String {
     let bytes: Cow<[u8]> = if compress {
-        Cow::Owned(zlib(raw))
+        Cow::Owned(zlib(bytes))
     } else {
-        Cow::Borrowed(raw)
+        Cow::Borrowed(bytes)
     };
     let compression = if compress { "o=z," } else { "" };
 
@@ -586,7 +760,7 @@ fn diacritic(y: u16) -> char {
 
 #[cfg(test)]
 mod tests {
-    use super::{DIACRITICS, PLACEHOLDER, diacritic, render, transmit_virtual};
+    use super::{DIACRITICS, PLACEHOLDER, diacritic, render, transmit_base64};
     use image::{DynamicImage, RgbaImage};
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Rect, Size};
@@ -766,7 +940,15 @@ mod tests {
     #[test]
     fn transmit_without_compression_is_the_raw_image() {
         let img = canvas();
-        let (params, bytes) = reassemble(&transmit_virtual(&img, 7, false, false));
+        let raw = img.to_rgba8();
+        let (params, bytes) = reassemble(&transmit_base64(
+            raw.as_raw(),
+            img.width(),
+            img.height(),
+            7,
+            false,
+            false,
+        ));
         assert!(
             !params.contains("o=z"),
             "nothing claims to be compressed: {params}"
@@ -786,7 +968,15 @@ mod tests {
     #[test]
     fn transmit_with_compression_inflates_back_to_the_raw_image() {
         let img = canvas();
-        let (params, bytes) = reassemble(&transmit_virtual(&img, 7, false, true));
+        let raw = img.to_rgba8();
+        let (params, bytes) = reassemble(&transmit_base64(
+            raw.as_raw(),
+            img.width(),
+            img.height(),
+            7,
+            false,
+            true,
+        ));
         assert!(
             params.contains("o=z"),
             "the payload is compressed and says so: {params}"
@@ -804,7 +994,6 @@ mod tests {
             "`S` is for PNG-plus-compression, and this is f=32"
         );
 
-        let raw = img.to_rgba8();
         assert!(
             bytes.len() < raw.as_raw().len(),
             "{} vs {}",
@@ -815,5 +1004,42 @@ mod tests {
         std::io::copy(&mut flate2::read::ZlibDecoder::new(&bytes[..]), &mut out)
             .expect("the whole payload is one zlib stream");
         assert_eq!(out, *raw.as_raw());
+    }
+
+    /// Two transmits of the SAME image id must still land in two different
+    /// objects — that is the entire fix: the terminal owns the first object
+    /// asynchronously from the moment its escape is written, and a second
+    /// transmit reusing that name would recreate it out from under a reader that
+    /// has not gotten to it yet. See [`super::transmit_shm`]'s doc comment.
+    #[test]
+    #[cfg(not(windows))]
+    fn consecutive_shm_transmits_of_the_same_id_use_different_objects() {
+        let img = canvas();
+        let raw = img.to_rgba8();
+        let first = super::transmit_shm(raw.as_raw(), img.width(), img.height(), 7, false)
+            .expect("this platform writes shared memory");
+        let second = super::transmit_shm(raw.as_raw(), img.width(), img.height(), 7, false)
+            .expect("this platform writes shared memory");
+
+        let name_of = |seq: &str| {
+            let start = seq.find(";").expect("payload starts after the header") + 1;
+            let end = seq.rfind("\x1b\\").expect("the ST ends the payload");
+            let name = base64_simd::STANDARD
+                .decode_to_vec(&seq[start..end])
+                .expect("the payload is base64");
+            String::from_utf8(name).expect("the object name is ASCII")
+        };
+        let (first_name, second_name) = (name_of(&first), name_of(&second));
+        assert_ne!(
+            first_name, second_name,
+            "same image id (7), but the object name must still differ so the second \
+             transmit can never touch an object the terminal may still be reading \
+             from the first: {first_name:?} vs {second_name:?}"
+        );
+
+        // Clean up: a successful `t=s` transmit is left for the terminal to
+        // unlink, which nothing here plays the part of.
+        let _ = rustix::shm::unlink(first_name);
+        let _ = rustix::shm::unlink(second_name);
     }
 }
