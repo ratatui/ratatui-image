@@ -13,7 +13,7 @@ fn main() {
     }
 
     // chafa-static: Static linking only (no fallback)
-    #[cfg(feature = "chafa-static")]
+    #[cfg(all(feature = "chafa-static", not(feature = "chafa-dyn")))]
     {
         let lib = pkg_config::Config::new()
             .statik(true)

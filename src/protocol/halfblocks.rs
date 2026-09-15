@@ -7,10 +7,6 @@
 //! - `chafa-static`: statically linked at compile time (requires static libchafa.a)
 //! - `chafa-dyn`: dynamically linked at compile time via pkg-config
 
-// Ensure only one chafa feature is enabled at a time
-#[cfg(all(feature = "chafa-static", feature = "chafa-dyn"))]
-compile_error!("features `chafa-static` and `chafa-dyn` are mutually exclusive");
-
 use image::DynamicImage;
 use ratatui::{
     buffer::{Buffer, Cell},

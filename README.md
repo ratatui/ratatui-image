@@ -147,6 +147,10 @@ The lib also includes a binary that renders an image file, but it is focused on 
   `--no-default-features --features image-defaults,crossterm` or a variation thereof.
 
 Note: The chafa features are mutually exclusive - enable only one at a time.
+There is *NO* compiler error for enabling both features at the same time, because some tools
+(like cargo-semver-checks) need to build with all features enabled. If both features are
+enabled, then `chafa-dyn` takes precedence, because that one makes it easier for running such
+tools in CI.
 
 #### Others
 
