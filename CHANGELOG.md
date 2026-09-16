@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.1.0](https://github.com/ratatui/ratatui-image/compare/v11.0.8...v11.1.0) - 2026-09-16
+
+### Added
+
+- *(picker)* expose tmux_detected()
+- detect kitty transmission compression, and use it
+
+### Fixed
+
+- fix regression from 967af26 "sliced sixel also uses round_pixel_size_to_cells"
+- *(kitty)* write one placeholder per cell so images render under tmux
+- widen before multiplying cell counts, not after
+
+### Other
+
+- suppress semver checks until next release
+- add some other fucking lib for release-plz
+- allow nonsensical chafa-dyn + chafa-static for some tools
+- fail if commits contain claude/anthropic spam
+- *(kitty)* hold the id colour in the id state tuple
+
 ## [11.0.8](https://github.com/ratatui/ratatui-image/compare/v11.0.7...v11.0.8) - 2026-09-04
 
 ### Other
