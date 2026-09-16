@@ -1,3 +1,4 @@
 [workspace]
 changelog_update = true
 publish_no_verify = true
+semver_check = false
