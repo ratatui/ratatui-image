@@ -2,8 +2,8 @@
 
 use std::{
     env,
-    io::{self, Read, Write},
-    sync::mpsc::Sender,
+    io::{self, Write},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -51,7 +51,7 @@ pub enum Capability {
     Background(u8, u8, u8),
 }
 
-const STDIN_READ_TIMEOUT_MILLIS: u64 = 2000;
+const STDIN_READ_TIMEOUT_MILLIS: i32 = 2000;
 
 #[derive(Clone, Debug)]
 pub struct Picker {
@@ -477,55 +477,6 @@ fn font_size_fallback() -> Option<FontSize> {
     None
 }
 
-/// Query the terminal, by writing and reading to stdin and stdout.
-/// The terminal must be in "raw mode" and should probably be reset to "cooked mode" when this
-/// operation has completed.
-///
-/// The returned [ProtocolType] and [FontSize] may be included in the list of [Capability]s,
-/// but the burden of picking out the right one or a font-size fallback is already resolved here.
-fn query_stdio_capabilities(
-    is_tmux: bool,
-    options: QueryStdioOptions,
-    tx: &Sender<QueryResult>,
-) -> Result<()> {
-    // Send several control sequences at once:
-    // `_Gi=...`: Kitty graphics support.
-    // `[c`: Capabilities including sixels.
-    // `[16t`: Cell-size (perhaps we should also do `[14t`).
-    // `[1337n`: iTerm2 (some terminals implement the protocol but sadly not this custom CSI)
-    // `[5n`: Device Status Report, implemented by all terminals, ensure that there is some
-    // response and we don't hang reading forever.
-    let query = Parser::query(is_tmux, options);
-    io::stdout().write_all(query.as_bytes())?;
-    io::stdout().flush()?;
-
-    let mut parser = Parser::new();
-    let mut responses = vec![];
-    'out: loop {
-        let mut charbuf: [u8; 50] = [0; 50];
-
-        let read = io::stdin().read(&mut charbuf)?;
-        // A read blocks a bit, keep receiver busy now.
-        tx.send(QueryResult::Busy)
-            .map_err(|_senderr| Errors::NoStdinResponse)?;
-
-        for ch in charbuf.iter().take(read) {
-            let mut more_caps = parser.push(char::from(*ch));
-            match more_caps[..] {
-                [Response::Status] => {
-                    break 'out;
-                }
-                _ => responses.append(&mut more_caps),
-            }
-        }
-    }
-
-    let result = interpret_parser_responses(responses)?;
-    tx.send(QueryResult::Done(result))
-        .map_err(|_senderr| Errors::NoStdinResponse)?;
-    Ok(())
-}
-
 fn interpret_parser_responses(
     responses: Vec<Response>,
 ) -> Result<(Option<ProtocolType>, Option<FontSize>, Vec<Capability>)> {
@@ -598,48 +549,138 @@ fn interpret_parser_responses(
     Ok((proto, font_size, capabilities))
 }
 
-enum QueryResult {
-    Done((Option<ProtocolType>, Option<FontSize>, Vec<Capability>)),
-    Err(Errors),
-    Busy,
-}
 fn query_with_timeout(
     is_tmux: bool,
     options: QueryStdioOptions,
 ) -> Result<(Option<ProtocolType>, Option<FontSize>, Vec<Capability>)> {
-    use std::{sync::mpsc, thread};
-    let (tx, rx) = mpsc::channel();
+    // Enter raw mode before sending query.
+    let disable_raw_mode = enable_raw_mode()?;
 
-    let timeout = options.timeout;
-    thread::spawn(move || {
-        if let Err(err) = tx
-            .send(QueryResult::Busy)
-            .map_err(|_senderr| Errors::NoStdinResponse)
-            .and_then(|_| enable_raw_mode())
-            .and_then(|disable_raw_mode| {
-                tx.send(QueryResult::Busy)
-                    .map_err(|_senderr| Errors::NoStdinResponse)?;
-                let result = query_stdio_capabilities(is_tmux, options, &tx);
-                disable_raw_mode()?;
-                result
-            })
-        {
-            // Last chance, fire and forget now.
-            let _ = tx.send(QueryResult::Err(err));
-        }
-    });
+    // Send several control sequences at once:
+    // `_Gi=...`: Kitty graphics support.
+    // `[c`: Capabilities including sixels.
+    // `[16t`: Cell-size (perhaps we should also do `[14t`).
+    // `[1337n`: iTerm2 (some terminals implement the protocol but sadly not this custom CSI)
+    // `[5n`: Device Status Report, implemented by all terminals, ensure that there is some
+    // response and we don't hang reading forever.
+    let timeout_ms = options.timeout_ms;
+    let query = Parser::query(is_tmux, options);
 
+    io::stdout().write_all(query.as_bytes())?;
+    io::stdout().flush()?;
+
+    let responses = poll_and_parse(timeout_ms)?;
+
+    disable_raw_mode()?;
+    interpret_parser_responses(responses)
+}
+
+// The important thing is that stdin reading must work with any size.
+const STDIN_READ_SIZE: usize = 64;
+
+fn poll_and_parse(timeout_ms: i32) -> Result<Vec<Response>> {
+    let mut parser = Parser::new();
+    let mut responses = vec![];
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
     loop {
-        match rx.recv_timeout(timeout) {
-            Ok(qresult) => match qresult {
-                QueryResult::Done(result) => return Ok(result),
-                QueryResult::Err(err) => return Err(err),
-                QueryResult::Busy => continue, // restarts the timeout
-            },
-            Err(_recverr) => {
-                return Err(Errors::NoStdinResponse);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Errors::NoStdinResponse);
+        }
+        // Don't let poll() overshoot the deadline, however unlikely.
+        let timeout_ms = remaining.as_millis() as i32;
+
+        let mut charbuf: [u8; STDIN_READ_SIZE] = [0; STDIN_READ_SIZE];
+        let read_count = poll_stdin(timeout_ms, &mut charbuf)?;
+        for ch in charbuf.iter().take(read_count) {
+            let mut more_caps = parser.push(char::from(*ch));
+            match more_caps[..] {
+                [Response::Status] => return Ok(responses),
+                _ => responses.append(&mut more_caps),
             }
         }
+    }
+}
+
+#[cfg(not(windows))]
+fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; STDIN_READ_SIZE]) -> Result<usize> {
+    use rustix::event::{PollFd, PollFlags, poll};
+    use rustix::fd::AsFd;
+    use rustix::io::read;
+    let stdin = io::stdin();
+    let stdin_fd = stdin.as_fd();
+    let mut pollfds = [PollFd::new(&stdin_fd, PollFlags::IN)];
+    let ready = poll(&mut pollfds, timeout_ms).map_err(|_| Errors::NoStdinResponse)?;
+    if ready == 0 {
+        return Err(Errors::NoStdinResponse);
+    }
+
+    let revents = pollfds[0].revents();
+
+    // https://man7.org/linux/man-pages/man2/poll.2.html
+    // POLLIN - There is data to read.
+    // POLLHUP - Hung up but there may still be data to read.
+    // The remaining events mean that something's wrong.
+    let readable = revents == PollFlags::IN || revents == (PollFlags::IN | PollFlags::HUP);
+
+    if !readable {
+        return Err(Errors::NoStdinResponse);
+    }
+
+    // Important to use rustix::io::read and not std::io::read, which can do its userspace
+    // buffering, where poll() would return 0 on next read.
+    Ok(read(stdin_fd, charbuf)?)
+}
+
+#[cfg(windows)]
+fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; STDIN_READ_SIZE]) -> Result<usize> {
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, WAIT_TIMEOUT};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{INPUT_RECORD, KEY_EVENT, ReadConsoleInputA};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    use windows::core::PCWSTR;
+
+    let utf16: Vec<u16> = "CONIN$\0".encode_utf16().collect();
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(utf16.as_ptr()),
+            (GENERIC_READ | GENERIC_WRITE).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )?
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+
+    loop {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u32;
+        if remaining == 0 {
+            return Err(Errors::NoStdinResponse);
+        }
+        if unsafe { WaitForSingleObject(handle, remaining) } == WAIT_TIMEOUT {
+            return Err(Errors::NoStdinResponse);
+        }
+        let mut record = INPUT_RECORD::default();
+        let mut count = 0u32;
+        unsafe { ReadConsoleInputA(handle, std::slice::from_mut(&mut record), &mut count)? };
+        if count == 0 {
+            continue;
+        }
+        if record.EventType as u32 == KEY_EVENT
+            && unsafe { record.Event.KeyEvent.bKeyDown.as_bool() }
+        {
+            charbuf[0] = unsafe { record.Event.KeyEvent.uChar.AsciiChar as u8 };
+            return Ok(1);
+        }
+        // Non-key event or key-up: discard and loop with remaining timeout.
     }
 }
 
