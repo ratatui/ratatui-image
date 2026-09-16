@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [11.1.0](https://github.com/ratatui/ratatui-image/compare/v11.0.8...v11.1.0) - 2026-09-16
+
+### Added
+
+- Kitty: write one placeholder per cell, `skip` not needed anymore
+- Query for kitty transmission compression (opt-in), and use it if detected
+- Picker: expose tmux_detected() method
+
+### Fixed
+
+- Fix regression from 967af26 "sliced sixel also uses round_pixel_size_to_cells"
+- Widen integer before multiplying cell counts, not after
+
+### Other
+
+- Allow nonsensical chafa-dyn + chafa-static for some tools
+
 ## [11.0.8](https://github.com/ratatui/ratatui-image/compare/v11.0.7...v11.0.8) - 2026-09-04
 
 ### Other
