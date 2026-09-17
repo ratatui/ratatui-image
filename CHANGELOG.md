@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [12.0.0-rc.0](https://github.com/ratatui/ratatui-image/compare/v11.1.0...v12.0.0-rc.0) - 2026-09-17
+
+### Added
+
+- probe for kitty shared memory support before using it
+
+### Fixed
+
+- fix windows
+
+### Other
+
+- release v12.0.0-rc.0
+- check poll events, only read if POLLIN and optionally POLLHUP.
+- use rustix::io::read for stdin
+- window poll_stdin uses CONIN$, discards non-keydown events
+- clippy
+- use rustix::event::poll instead of thread
+- suppress windows warnings
+- just generate one random number then, clean up
+- kitty shared memory object transmit
+- Revert "suppress semver checks until next release"
+
 ## [11.1.0](https://github.com/ratatui/ratatui-image/compare/v11.0.8...v11.1.0) - 2026-09-16
 
 ### Added
