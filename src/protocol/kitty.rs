@@ -20,7 +20,7 @@ use rustix::{
 
 use crate::protocol::UNIT_WIDTH;
 use crate::{Result, picker::cap_parser::Parser};
-use image::DynamicImage;
+use image::{DynamicImage, RgbaImage};
 use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::{buffer::Buffer, layout::Rect};
@@ -38,20 +38,19 @@ struct KittyProtoState {
 }
 
 impl KittyProtoState {
-    fn new(img: &DynamicImage, id: u32, is_tmux: bool, compress: bool, smo: bool) -> Result<Self> {
+    fn new(
+        img: &DynamicImage,
+        cells: Size,
+        id: u32,
+        is_tmux: bool,
+        compress: bool,
+        smo: bool,
+    ) -> Result<Self> {
         // The only caller that holds a `DynamicImage`: every transmit path below
         // takes raw RGBA bytes plus dimensions, so the conversion happens once,
         // here, rather than once per path.
         let img_rgba8 = img.to_rgba8();
-        let transmit_str = transmit_or_shm(
-            img_rgba8.as_raw(),
-            img.width(),
-            img.height(),
-            id,
-            is_tmux,
-            compress,
-            smo,
-        )?;
+        let transmit_str = transmit_or_shm(&img_rgba8, cells, id, is_tmux, compress, smo)?;
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         Ok(Self {
             transmitted: Arc::new(AtomicBool::new(false)),
@@ -87,7 +86,7 @@ impl Kitty {
         compress: bool,
         smo: bool,
     ) -> Result<Self> {
-        let proto_state = KittyProtoState::new(&image, id, is_tmux, compress, smo)?;
+        let proto_state = KittyProtoState::new(&image, size, id, is_tmux, compress, smo)?;
         Ok(Self { proto_state, size })
     }
 
@@ -162,7 +161,7 @@ impl StatefulProtocolTrait for StatefulKitty {
         self.size = size;
         // If resized then we must transmit again.
         self.proto_state =
-            KittyProtoState::new(&img, self.id.0, self.is_tmux, self.compress, self.smo)?;
+            KittyProtoState::new(&img, size, self.id.0, self.is_tmux, self.compress, self.smo)?;
         Ok(())
     }
 }
@@ -231,19 +230,19 @@ fn zlib(raw: &[u8]) -> Vec<u8> {
 
 #[cfg_attr(windows, allow(unused_variables))]
 fn transmit_or_shm(
-    bytes: &[u8],
-    w: u32,
-    h: u32,
+    img: &RgbaImage,
+    cells: Size,
     id: u32,
     is_tmux: bool,
     compress: bool,
     smo: bool,
 ) -> Result<String> {
+    let (bytes, w, h) = (img.as_raw(), img.width(), img.height());
     #[cfg(not(windows))]
     if smo {
-        return transmit_shm(bytes, w, h, id, is_tmux);
+        return transmit_shm(bytes, w, h, cells, id, is_tmux);
     }
-    Ok(transmit_base64(bytes, w, h, id, is_tmux, compress))
+    Ok(transmit_base64(bytes, w, h, cells, id, is_tmux, compress))
 }
 
 /// Create a shared memory object.
@@ -360,7 +359,14 @@ pub(crate) fn generate_shm_name() -> String {
 /// the same way an untransmitted base64 image is left marked transmitted but never
 /// shown.
 #[cfg(not(windows))]
-fn transmit_shm(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool) -> Result<String> {
+fn transmit_shm(
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+    cells: Size,
+    id: u32,
+    is_tmux: bool,
+) -> Result<String> {
     let shm_name = generate_shm_name();
     shm_write(&shm_name, bytes)?;
 
@@ -372,7 +378,8 @@ fn transmit_shm(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool) -> Result<
     data.push_str(start);
     write!(
         data,
-        "{escape}_Gq=2,i={id},a=T,U=1,f=32,t=s,s={w},v={h},m=0;"
+        "{escape}_Gq=2,i={id},a=T,U=1,f=32,t=s,s={w},v={h},c={},r={},m=0;",
+        cells.width, cells.height
     )
     .unwrap();
     base64_simd::STANDARD.encode_append(shm_name.as_bytes(), &mut data);
@@ -386,6 +393,8 @@ fn transmit_shm(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool) -> Result<
 ///
 /// The image will be transmitted as RGBA in chunks of 4096 bytes.
 /// A "virtual placement" (U=1) is created so that we can place it using unicode placeholders.
+/// The placement spans `cells`, the cells the placeholders cover, so the terminal scales the
+/// image into them whatever its own cell size is.
 /// Removing the placements when the unicode placeholder is no longer there is being handled
 /// automatically by kitty.
 ///
@@ -400,7 +409,15 @@ fn transmit_shm(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool) -> Result<
 /// `compress` must only be set when the terminal answered the `o=z` capability
 /// probe: a terminal that cannot inflate refuses the transmission outright, and
 /// every placement naming the image then draws nothing at all.
-fn transmit_base64(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool, compress: bool) -> String {
+fn transmit_base64(
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+    cells: Size,
+    id: u32,
+    is_tmux: bool,
+    compress: bool,
+) -> String {
     let bytes: Cow<[u8]> = if compress {
         Cow::Owned(zlib(bytes))
     } else {
@@ -433,7 +450,12 @@ fn transmit_base64(bytes: &[u8], w: u32, h: u32, id: u32, is_tmux: bool, compres
         write!(data, "{escape}_Gq=2,").unwrap();
 
         if i == 0 {
-            write!(data, "i={id},a=T,U=1,f=32,{compression}t=d,s={w},v={h},").unwrap();
+            write!(
+                data,
+                "i={id},a=T,U=1,f=32,{compression}t=d,s={w},v={h},c={},r={},",
+                cells.width, cells.height
+            )
+            .unwrap();
         }
 
         // m=0 means over
@@ -945,6 +967,7 @@ mod tests {
             raw.as_raw(),
             img.width(),
             img.height(),
+            Size::new(8, 4),
             7,
             false,
             false,
@@ -973,6 +996,7 @@ mod tests {
             raw.as_raw(),
             img.width(),
             img.height(),
+            Size::new(8, 4),
             7,
             false,
             true,
@@ -1016,10 +1040,24 @@ mod tests {
     fn consecutive_shm_transmits_of_the_same_id_use_different_objects() {
         let img = canvas();
         let raw = img.to_rgba8();
-        let first = super::transmit_shm(raw.as_raw(), img.width(), img.height(), 7, false)
-            .expect("this platform writes shared memory");
-        let second = super::transmit_shm(raw.as_raw(), img.width(), img.height(), 7, false)
-            .expect("this platform writes shared memory");
+        let first = super::transmit_shm(
+            raw.as_raw(),
+            img.width(),
+            img.height(),
+            Size::new(8, 4),
+            7,
+            false,
+        )
+        .expect("this platform writes shared memory");
+        let second = super::transmit_shm(
+            raw.as_raw(),
+            img.width(),
+            img.height(),
+            Size::new(8, 4),
+            7,
+            false,
+        )
+        .expect("this platform writes shared memory");
 
         let name_of = |seq: &str| {
             let start = seq.find(";").expect("payload starts after the header") + 1;
@@ -1041,5 +1079,51 @@ mod tests {
         // unlink, which nothing here plays the part of.
         let _ = rustix::shm::unlink(first_name);
         let _ = rustix::shm::unlink(second_name);
+    }
+
+    /// The parameters of a protocol's pending transmission.
+    fn placement_params(proto_state: &super::KittyProtoState) -> (String, Vec<u8>) {
+        reassemble(
+            proto_state
+                .transmit_str
+                .as_deref()
+                .expect("a freshly encoded image has a transmission"),
+        )
+    }
+
+    /// The placement names its size in cells (`c`, `r`): the cells its
+    /// placeholders cover. Without them the terminal derives the cells from
+    /// the image's pixels and its own cell size, so when that differs from
+    /// the font size the image was resized with, the image is cropped or
+    /// falls short of its area. That happens after a font size change, and
+    /// in tmux when the attached clients have different cell sizes.
+    #[test]
+    fn the_placement_covers_the_cells_of_its_placeholders() {
+        use super::super::StatefulProtocolTrait;
+
+        let size = Size::new(8, 4);
+        let kitty = super::Kitty::new(canvas(), size, 7, false, false, false)
+            .expect("encoding into a string cannot fail");
+        let (params, _) = placement_params(&kitty.proto_state);
+        assert!(params.contains("c=8,r=4"), "{params}");
+
+        let mut stateful = super::StatefulKitty::new(7, false, false, false);
+        stateful
+            .resize_encode(canvas(), size)
+            .expect("encoding into a string cannot fail");
+        let (params, _) = placement_params(&stateful.proto_state);
+        assert!(params.contains("c=8,r=4"), "{params}");
+    }
+
+    /// The shared memory transmission creates the same placement.
+    #[test]
+    #[cfg(not(windows))]
+    fn the_shm_placement_covers_the_cells_of_its_placeholders() {
+        let kitty = super::Kitty::new(canvas(), Size::new(8, 4), 7, false, false, true)
+            .expect("this platform writes shared memory");
+        let (params, name) = placement_params(&kitty.proto_state);
+        // The terminal would unlink the object; nothing here plays its part.
+        let _ = rustix::shm::unlink(String::from_utf8(name).expect("the object name is ASCII"));
+        assert!(params.contains("c=8,r=4"), "{params}");
     }
 }
