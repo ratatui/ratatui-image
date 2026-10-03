@@ -107,14 +107,18 @@ impl Picker {
         Picker::from_query_stdio_with_options(QueryStdioOptions::default())
     }
 
-    /// This should ONLY be used if [Capability::TextSizingProtocol] is needed for some external
-    /// reason.
+    /// Like [Picker::from_query_stdio], with [QueryStdioOptions] to change how the query runs and
+    /// what else it asks for:
     ///
-    /// Query for additional capabilities, currently supports querying for [Text Sizing Protocol].
+    /// * [QueryStdioOptions::timeout_ms]: how long to wait for a terminal that never answers.
+    /// * [QueryStdioOptions::kitty_shared_memory_object]: probe kitty's shared memory transmission,
+    ///   and use it where the terminal reads it back.
+    /// * [QueryStdioOptions::kitty_compression], [QueryStdioOptions::terminal_background_color_osc]
+    ///   and [QueryStdioOptions::text_sizing_protocol]: further probes.
+    /// * [QueryStdioOptions::blacklist_protocols]: protocols not to detect.
     ///
-    /// The result can be checked by searching for [Capability::TextSizingProtocol] in [Picker::capabilities].
-    ///
-    /// [Text Sizing Protocol] <https://sw.kovidgoyal.net/kitty/text-sizing-protocol//>
+    /// What the probes found is in [Picker::capabilities], for example
+    /// [Capability::KittySharedMemory] or [Capability::TextSizingProtocol].
     pub fn from_query_stdio_with_options(mut options: QueryStdioOptions) -> Result<Self> {
         // Detect tmux, and only if positive then take some risky guess for iTerm2 support.
         let (is_tmux, tmux_proto) = detect_tmux_and_outer_protocol_from_env();
