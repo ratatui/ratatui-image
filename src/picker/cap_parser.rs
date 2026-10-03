@@ -82,13 +82,14 @@ pub struct QueryStdioOptions {
     /// For a successful transmit, this is a no-op. If the terminal didn't unlink it, then it also
     /// should not have read it back.
     ///
-    /// The filename scheme is defined at [`crate::protocol::kitty::shm_name`].
+    /// The name is `/rtui-` and those 22 characters, in URL-safe Base64 without padding: a fresh
+    /// one from [`QueryStdioOptions::probe_kitty_smo`].
     pub kitty_shared_memory_object: Option<String>,
 }
 
 impl QueryStdioOptions {
-    /// Public wrapper around [`crate::protocol::kitty::shm_name`].
-    /// Used to configure [`QueryStdioOptions::kitty_shared_memory_object`].
+    /// A fresh name for [`QueryStdioOptions::kitty_shared_memory_object`], in the scheme its
+    /// transmits use.
     #[cfg(not(windows))]
     pub fn probe_kitty_smo() -> Option<String> {
         let filename = crate::protocol::kitty::generate_shm_name();
@@ -161,7 +162,7 @@ impl Parser {
 
             // Kitty shared memory transmission: probed by writing the same one RGBA
             // pixel a real `t=s` transmit would, through the same two primitives
-            // (`kitty::shm_name` + `kitty::shm_write`) a real transmit uses - not
+            // (`kitty::generate_shm_name` + `kitty::shm_write`) a real transmit uses - not
             // `kitty::transmit_shm` itself, since that builds a real `a=T` display
             // escape and this probe needs the protocol's own `a=q` query shape
             // wrapped around the same object instead.
