@@ -322,9 +322,10 @@ mod sixel_slice {
             let skip_bands = (skip_line_count * self.font_height as usize).div_ceil(6);
 
             let bands: Vec<&str> = self.bands.to_vec();
-            let take_bands = ((self.size.height.saturating_sub(drop_line_count as u16)) as usize
+            let end_bands = ((self.size.height.saturating_sub(drop_line_count as u16)) as usize
                 * self.font_height as usize)
                 / 6;
+            let take_bands = end_bands.saturating_sub(skip_bands);
 
             let sliced_bands: Vec<&str> = bands
                 .iter()
@@ -636,6 +637,14 @@ mod sixel_slice {
 
             // one row is 20px, 20/6 = 3 bands
             assert_eq!(3, sliced.bands(0, 11).len());
+
+            // Skipping lines does not move the bottom edge down.
+            // Rows 1..2 are pixels 20..40: bands ceil(20/6) = 4 up to floor(40/6) = 6.
+            assert_eq!(sliced.bands(0, 0)[4..6], sliced.bands(1, 10)[..]);
+            // Rows 5..12 are pixels 100..240: bands ceil(100/6) = 17 to the end at 38.
+            assert_eq!(sliced.bands(0, 0)[17..], sliced.bands(5, 0)[..]);
+            // Nothing left between skip and drop.
+            assert!(sliced.bands(6, 6).is_empty());
         }
     }
 }
