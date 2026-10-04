@@ -94,8 +94,13 @@ impl ProtocolType {
 impl Picker {
     /// Query terminal stdio for graphics capabilities and font-size with some escape sequences.
     ///
-    /// This writes and reads from stdio momentarily. WARNING: this method should be called after
-    /// entering alternate screen but before reading terminal events.
+    /// # Important
+    ///
+    /// Must be called before reading events from stdin.
+    ///
+    /// Sends several queries as escape sequences to stdout, reads back the terminal's reply from
+    /// stdin. Common input reading like `ratatui::event::read()` (or e.g. crossterm's) also reads
+    /// from stdin, so those get garbage input events and prevent [Picker] from parsing the reply.
     ///
     /// # Example
     /// ```rust
@@ -107,18 +112,11 @@ impl Picker {
         Picker::from_query_stdio_with_options(QueryStdioOptions::default())
     }
 
-    /// Like [Picker::from_query_stdio], with [QueryStdioOptions] to change how the query runs and
-    /// what else it asks for:
+    /// Like [Picker::from_query_stdio], but with extra options.
     ///
-    /// * [QueryStdioOptions::timeout_ms]: how long to wait for a terminal that never answers.
-    /// * [QueryStdioOptions::kitty_shared_memory_object]: probe kitty's shared memory transmission,
-    ///   and use it where the terminal reads it back.
-    /// * [QueryStdioOptions::kitty_compression], [QueryStdioOptions::terminal_background_color_osc]
-    ///   and [QueryStdioOptions::text_sizing_protocol]: further probes.
-    /// * [QueryStdioOptions::blacklist_protocols]: protocols not to detect.
+    /// See [QueryStdioOptions] for documentation the exact options. Generally,
     ///
-    /// What the probes found is in [Picker::capabilities], for example
-    /// [Capability::KittySharedMemory] or [Capability::TextSizingProtocol].
+    /// The specific results of some of the options can be inspected on [Picker::capabilities].
     pub fn from_query_stdio_with_options(mut options: QueryStdioOptions) -> Result<Self> {
         // Detect tmux, and only if positive then take some risky guess for iTerm2 support.
         let (is_tmux, tmux_proto) = detect_tmux_and_outer_protocol_from_env();

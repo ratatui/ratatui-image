@@ -39,9 +39,14 @@ pub struct QueryStdioOptions {
     /// [Text Sizing Protocol] <https://sw.kovidgoyal.net/kitty/text-sizing-protocol//>
     pub text_sizing_protocol: bool,
     /// Query the terminal background color. The result will be
-    /// [`crate::picker::Capability::Background`] in the capabilities.
+    /// [`crate::picker::Capability::Background`], with the RGB value, in the capabilities.
     ///
-    /// This can be useful for sixels which have binary transparency instead of an alpha channel.
+    /// For example, sixels have binary transparency which can make PNG images with an alpha
+    /// channel look quite bad. If the protocol is [`ProtocolType::Sixel`], and a
+    /// [`crate::picker::Capability::Background`] has been found, then it is possible to overlay
+    /// the [`image::RgbaImage`] over a flat rectangle with the background color before passing it
+    /// to [`crate::picker::Picker`]. This gives the effect of the alpha channel without an actual
+    /// alpha channel.
     pub terminal_background_color_osc: bool,
     /// Blacklist protocols from the detection query. Currently only kitty can be detected, so that
     /// is the only ProtocolType that can have any effect here.
@@ -67,7 +72,8 @@ pub struct QueryStdioOptions {
     /// back with the protocol's own query action (`a=q`).
     ///
     /// [`crate::picker::Capability::KittySharedMemory`] is reported only where the terminal
-    /// answered `OK`.
+    /// answered `OK`. The [`crate::picker::Picker`] instance picks this up and will use it
+    /// automatically.
     ///
     /// See <https://sw.kovidgoyal.net/kitty/graphics-protocol/#the-transmission-medium>.
     ///
