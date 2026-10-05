@@ -1,8 +1,4 @@
-name: Release-plz
-
-permissions:
-  pull-requests: write
-  contents: write
+name: Release-plz release
 
 on:
   push:
@@ -10,30 +6,36 @@ on:
       - master
 
 jobs:
-  nix-flake-check:
-    name: Nix flake check
+  wait-for-ci:
+    name: Wait for CI
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'ratatui' }}
+    permissions:
+      actions: read
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Install Nix
-        uses: cachix/install-nix-action@v24
-      - name: Cachix
-        uses: cachix/cachix-action@v12
-        with:
-          name: ratatui-image-ci
-          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
-      - name: Flake check
+      - name: Wait for CI to pass
         run: |
-          nix flake show
-          nix flake check --print-build-logs
+          echo "Waiting for CI on ${{ github.sha }}..."
+          for i in $(seq 1 60); do
+            conclusion=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yaml/runs" \
+              --jq "[.workflow_runs[] | select(.head_sha == \"${{ github.sha }}\")] | .[0].conclusion // \"pending\"")
+            echo "CI conclusion: $conclusion"
+            if [ "$conclusion" = "success" ]; then exit 0; fi
+            if [ "$conclusion" = "failure" ] || [ "$conclusion" = "cancelled" ]; then
+              echo "CI did not pass"
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "Timed out waiting for CI"
+          exit 1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Release unpublished packages.
   release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-latest
-    needs: nix-flake-check
+    needs: wait-for-ci
     environment: release
     if: ${{ github.repository_owner == 'ratatui' }}
     permissions:
@@ -50,29 +52,5 @@ jobs:
         uses: MarcoIeni/release-plz-action@v0.5
         with:
           command: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # Create a PR with the new versions and changelog, preparing the next release.
-  release-plz-pr:
-    name: Release-plz PR
-    runs-on: ubuntu-latest
-    if: ${{ github.repository_owner == 'ratatui' }}
-    concurrency:
-      group: release-plz-${{ github.ref }}
-      cancel-in-progress: false
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libchafa-dev libglib2.0-dev
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run release-plz
-        uses: MarcoIeni/release-plz-action@v0.5
-        with:
-          command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

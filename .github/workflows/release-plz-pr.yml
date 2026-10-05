@@ -1,0 +1,35 @@
+name: Release-plz PR
+
+permissions:
+  pull-requests: write
+  contents: write
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [master]
+
+jobs:
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.repository_owner == 'ratatui' }}
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libchafa-dev libglib2.0-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}
