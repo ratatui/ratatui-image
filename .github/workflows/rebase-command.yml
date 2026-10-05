@@ -1,0 +1,12 @@
+name: rebase-command
+on:
+  repository_dispatch:
+    types: [rebase-command]
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: peter-evans/rebase@v4
+        with:
+          token: ${{ secrets.PAT }}
+          head: ${{ github.event.client_payload.pull_request.head.label }}

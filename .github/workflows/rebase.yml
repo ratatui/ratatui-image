@@ -1,0 +1,15 @@
+name: rebase
+on:
+  issue_comment:
+    types: [created, edited]
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: peter-evans/slash-command-dispatch@v5
+        with:
+          token: ${{ secrets.PAT }}
+          commands: rebase
+          permission: write
+          issue-type: pull-request
+          allow-edits: true
