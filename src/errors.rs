@@ -1,7 +1,5 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Errors {
-    #[error("Could not detect font size")]
-    NoFontSize,
     #[error("Could not detect any graphics nor font capabilities")]
     NoCap,
     #[error("No response from stdin")]
