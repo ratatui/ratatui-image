@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [12.0.0-rc.1](https://github.com/ratatui/ratatui-image/compare/v12.0.0-rc.0...v12.0.0-rc.1) - 2026-10-05
+
+### Fixed
+
+- *(sliced)* fix images that are cut from top and bottom at the same time
+- *(kitty)* give the placement's size in cells (c/r)
+- fix tmux passthrough escapes for sliced sixel ([#192](https://github.com/ratatui/ratatui-image/pull/192))
+
+### Other
+
+- let release-plz checks run without approval
+- don't run CI twice, use CI from master for release-plz
+- release v12.0.0-rc.1
+- rebase with comment-command
+- *(cap_parser)* fix the links to the renamed shm_name
+- touch up docs a bit
+- *(picker)* say what from_query_stdio_with_options is for
+- sliced sixel: <esc>P was already found once, re-use it.
+- sixel tmux manually replace the two specific escapes
+
 ## [11.1.0](https://github.com/ratatui/ratatui-image/compare/v11.0.8...v11.1.0) - 2026-09-16
 
 ### Added
