@@ -1,5 +1,7 @@
 //! Terminal stdio query parser module.
 use std::fmt::Write;
+#[cfg(not(windows))]
+use std::os::fd::OwnedFd;
 
 use crate::picker::{ProtocolType, STDIN_READ_TIMEOUT_MILLIS};
 
@@ -85,6 +87,25 @@ pub struct QueryStdioOptions {
     /// The name is `/rtui-` and those 22 characters, in URL-safe Base64 without padding: a fresh
     /// one from [`QueryStdioOptions::probe_kitty_smo`].
     pub kitty_shared_memory_object: Option<String>,
+    /// Use specific file descriptors instead of [`std::io::stdin()`] and [`std::io::stdout()`].
+    ///
+    /// Can be useful if stdio is already being used for piped data.
+    ///
+    /// Not supported on windows.
+    ///
+    /// ```rust
+    /// # use ratatui_image::picker::cap_parser::QueryStdioOptions;
+    /// let options = QueryStdioOptions {
+    ///     #[cfg(not(windows))]
+    ///     stdio: QueryStdioOptions::stdio_dev_tty().ok(),
+    ///     ..Default::default()
+    /// };
+    /// ```
+    ///
+    /// See `examples/dump.rs` for a program that reads data from stdin, and directly writes the
+    /// output to stdout, by using `/dev/tty`.
+    #[cfg(not(windows))]
+    pub stdio: Option<(OwnedFd, OwnedFd)>,
 }
 
 impl QueryStdioOptions {
@@ -94,6 +115,16 @@ impl QueryStdioOptions {
     pub fn probe_kitty_smo() -> Option<String> {
         let filename = crate::protocol::kitty::generate_shm_name();
         Some(filename)
+    }
+    /// Helper for creating the stdin and stdout pair from `/dev/tty`.
+    #[cfg(not(windows))]
+    pub fn stdio_dev_tty() -> std::io::Result<(OwnedFd, OwnedFd)> {
+        let fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .map(OwnedFd::from)?;
+        Ok((fd.try_clone()?, fd))
     }
 }
 
@@ -106,6 +137,8 @@ impl Default for QueryStdioOptions {
             blacklist_protocols: Vec::new(),
             kitty_compression: false,
             kitty_shared_memory_object: None,
+            #[cfg(not(windows))]
+            stdio: None,
         }
     }
 }

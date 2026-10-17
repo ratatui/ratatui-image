@@ -1,8 +1,10 @@
 //! Helper module to build a protocol, and swap protocols at runtime
 
+#[cfg(not(windows))]
+use std::os::fd::{AsFd, BorrowedFd};
 use std::{
     env,
-    io::{self, Write},
+    io::{self},
     time::{Duration, Instant},
 };
 
@@ -383,21 +385,20 @@ fn iterm2_from_env() -> Option<ProtocolType> {
 }
 
 #[cfg(not(windows))]
-fn enable_raw_mode() -> Result<impl FnOnce() -> Result<()>> {
+fn enable_raw_mode(stdin: BorrowedFd) -> Result<impl FnOnce() -> Result<()>> {
     use rustix::termios::{self, LocalModes, OptionalActions};
 
-    let stdin = io::stdin();
-    let mut termios = termios::tcgetattr(&stdin)?;
+    let mut termios = termios::tcgetattr(stdin)?;
     let termios_original = termios.clone();
 
     // Disable canonical mode to read without waiting for Enter, disable echoing.
     termios.local_modes &= !LocalModes::ICANON;
     termios.local_modes &= !LocalModes::ECHO;
-    termios::tcsetattr(&stdin, OptionalActions::Drain, &termios)?;
+    termios::tcsetattr(stdin, OptionalActions::Drain, &termios)?;
 
     Ok(move || {
         Ok(termios::tcsetattr(
-            io::stdin(),
+            stdin,
             OptionalActions::Now,
             &termios_original,
         )?)
@@ -537,11 +538,8 @@ fn interpret_parser_responses(
 
 fn query_with_timeout(
     is_tmux: bool,
-    options: QueryStdioOptions,
+    mut options: QueryStdioOptions,
 ) -> Result<(Option<ProtocolType>, Option<FontSize>, Vec<Capability>)> {
-    // Enter raw mode before sending query.
-    let disable_raw_mode = enable_raw_mode()?;
-
     // Send several control sequences at once:
     // `_Gi=...`: Kitty graphics support.
     // `[c`: Capabilities including sixels.
@@ -550,21 +548,50 @@ fn query_with_timeout(
     // `[5n`: Device Status Report, implemented by all terminals, ensure that there is some
     // response and we don't hang reading forever.
     let timeout_ms = options.timeout_ms;
-    let query = Parser::query(is_tmux, options);
 
-    io::stdout().write_all(query.as_bytes())?;
-    io::stdout().flush()?;
+    #[cfg(not(windows))]
+    {
+        let stdio = options.stdio.take();
+        let (stdin, stdout) = stdio
+            .as_ref()
+            .map(|(stdin, stdout)| (stdin.as_fd(), stdout.as_fd()))
+            .unwrap_or_else(|| (rustix::stdio::stdin(), rustix::stdio::stdout()));
 
-    let responses = poll_and_parse(timeout_ms)?;
+        let disable_raw_mode = enable_raw_mode(stdin)?;
 
-    disable_raw_mode()?;
-    interpret_parser_responses(responses)
+        let query = Parser::query(is_tmux, options);
+
+        rustix::io::write(stdout, query.as_bytes())?;
+
+        let responses = poll_and_parse(stdin, timeout_ms)?;
+
+        disable_raw_mode()?;
+        interpret_parser_responses(responses)
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Write as _;
+        let disable_raw_mode = enable_raw_mode()?;
+
+        let query = Parser::query(is_tmux, options);
+
+        io::stdout().write_all(query.as_bytes())?;
+        io::stdout().flush()?;
+
+        let responses = poll_and_parse(timeout_ms)?;
+
+        disable_raw_mode()?;
+        interpret_parser_responses(responses)
+    }
 }
 
 // The important thing is that stdin reading must work with any size.
 const STDIN_READ_SIZE: usize = 64;
 
-fn poll_and_parse(timeout_ms: i32) -> Result<Vec<Response>> {
+fn poll_and_parse(
+    #[cfg(not(windows))] stdin: BorrowedFd,
+    timeout_ms: i32,
+) -> Result<Vec<Response>> {
     let mut parser = Parser::new();
     let mut responses = vec![];
     let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
@@ -577,6 +604,9 @@ fn poll_and_parse(timeout_ms: i32) -> Result<Vec<Response>> {
         let timeout_ms = remaining.as_millis() as i32;
 
         let mut charbuf: [u8; STDIN_READ_SIZE] = [0; STDIN_READ_SIZE];
+        #[cfg(not(windows))]
+        let read_count = poll_stdin(stdin, timeout_ms, &mut charbuf)?;
+        #[cfg(windows)]
         let read_count = poll_stdin(timeout_ms, &mut charbuf)?;
         for ch in charbuf.iter().take(read_count) {
             let mut more_caps = parser.push(char::from(*ch));
@@ -598,12 +628,13 @@ impl Drop for KittySmoProbeGuard {
 }
 
 #[cfg(not(windows))]
-fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; STDIN_READ_SIZE]) -> Result<usize> {
+fn poll_stdin(
+    stdin_fd: BorrowedFd,
+    timeout_ms: i32,
+    charbuf: &mut [u8; STDIN_READ_SIZE],
+) -> Result<usize> {
     use rustix::event::{PollFd, PollFlags, poll};
-    use rustix::fd::AsFd;
     use rustix::io::read;
-    let stdin = io::stdin();
-    let stdin_fd = stdin.as_fd();
     let mut pollfds = [PollFd::new(&stdin_fd, PollFlags::IN)];
     let ready = poll(&mut pollfds, timeout_ms).map_err(|_| Errors::NoStdinResponse)?;
     if ready == 0 {
