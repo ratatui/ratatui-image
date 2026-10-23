@@ -121,7 +121,7 @@ impl ProtocolTrait for Kitty {
 
 #[derive(Clone)]
 pub struct StatefulKitty {
-    id: (u32, Color, u16), // Full ID, ID as fg color, ID extra part for diacritic
+    next_id: u32,
     size: Size,
     proto_state: KittyProtoState,
     is_tmux: bool,
@@ -132,10 +132,17 @@ pub struct StatefulKitty {
 impl StatefulKitty {
     pub fn new(id: u32, is_tmux: bool, compress: bool, smo: bool) -> StatefulKitty {
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
+        let mut next_id = rand::random();
+        while next_id == 0 || next_id == id {
+            next_id = rand::random();
+        }
         StatefulKitty {
-            id: (id, Color::Rgb(id_r, id_g, id_b), u16::from(id_extra)),
+            next_id,
             size: Size::default(),
-            proto_state: KittyProtoState::default(),
+            proto_state: KittyProtoState {
+                id: (id, Color::Rgb(id_r, id_g, id_b), u16::from(id_extra)),
+                ..KittyProtoState::default()
+            },
             is_tmux,
             compress,
             smo,
@@ -148,7 +155,7 @@ impl ProtocolTrait for StatefulKitty {
         // Transmit only once. This is why self is mut.
         let seq = self.proto_state.make_transmit();
 
-        render(area, self.size, buf, &self.id, seq, 0);
+        render(area, self.size, buf, &self.proto_state.id, seq, 0);
     }
 
     fn size(&self) -> Size {
@@ -158,10 +165,22 @@ impl ProtocolTrait for StatefulKitty {
 
 impl StatefulProtocolTrait for StatefulKitty {
     fn resize_encode(&mut self, img: DynamicImage, size: Size) -> Result<()> {
+        // A retransmit deletes the image already using that ID. Upload to the
+        // other ID, and only switch back after this state's transmit was rendered.
+        let transmitted = self.proto_state.transmit_str.is_some()
+            && self.proto_state.transmitted.load(Ordering::SeqCst);
+        let id = if transmitted {
+            self.next_id
+        } else {
+            self.proto_state.id.0
+        };
+        let proto_state =
+            KittyProtoState::new(&img, size, id, self.is_tmux, self.compress, self.smo)?;
+        if transmitted {
+            self.next_id = self.proto_state.id.0;
+        }
         self.size = size;
-        // If resized then we must transmit again.
-        self.proto_state =
-            KittyProtoState::new(&img, size, self.id.0, self.is_tmux, self.compress, self.smo)?;
+        self.proto_state = proto_state;
         Ok(())
     }
 }
@@ -922,6 +941,99 @@ mod tests {
 
         assert_eq!(marks(&buf, 0, 0)[0], diacritic(5));
         assert_eq!(marks(&buf, 0, 1)[0], diacritic(6));
+    }
+
+    fn rendered_stateful(kitty: &super::StatefulKitty) -> Buffer {
+        use super::ProtocolTrait;
+        let area = Rect::new(0, 0, kitty.size.width, kitty.size.height);
+        let mut buf = Buffer::empty(area);
+        kitty.render(area, &mut buf);
+        buf
+    }
+
+    /// Read the actual APC headers, including those wrapped for tmux.
+    fn command_headers(buf: &Buffer) -> Vec<String> {
+        let seq = buf[(0, 0)].symbol().replace("\x1b\x1b", "\x1b");
+        seq.split("\x1b_G")
+            .skip(1)
+            .map(|cmd| cmd.split_once(';').unwrap().0.to_owned())
+            .collect()
+    }
+
+    fn upload_id(headers: &[String]) -> u32 {
+        headers[0]
+            .split(',')
+            .find_map(|field| field.strip_prefix("i="))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn placeholder_id(buf: &Buffer) -> u32 {
+        let Color::Rgb(r, g, b) = buf[(0, 0)].fg else {
+            panic!("Kitty placeholders must carry the image ID as their foreground");
+        };
+        let extra = buf[(0, 0)].symbol().chars().last().unwrap();
+        let extra = DIACRITICS.iter().position(|&mark| mark == extra).unwrap() as u8;
+        u32::from_be_bytes([extra, r, g, b])
+    }
+
+    #[test]
+    fn stateful_replacements_never_upload_to_the_visible_id() {
+        use super::StatefulProtocolTrait;
+        for is_tmux in [false, true] {
+            let mut kitty = super::StatefulKitty::new(0x0102_0304, is_tmux, false, false);
+            let mut ids = Vec::new();
+            for generation in 0..6 {
+                kitty
+                    .resize_encode(canvas(), Size::new(8 + generation, 2))
+                    .unwrap();
+                let buf = rendered_stateful(&kitty);
+                let headers = command_headers(&buf);
+                assert!(headers.len() > 1, "exercise a multi-chunk upload");
+                assert!(headers[0].contains("m=1"));
+                assert!(headers.last().unwrap().contains("m=0"));
+                let id = upload_id(&headers);
+                assert_eq!(placeholder_id(&buf), id, "switch to the uploaded ID");
+                if let Some(&visible) = ids.last() {
+                    assert_ne!(
+                        id, visible,
+                        "replacement starts transmitting to the still-visible ID; \
+                         Kitty deletes its image and placements before m=0 (tmux={is_tmux})"
+                    );
+                }
+                if ids.len() >= 2 {
+                    assert_eq!(id, ids[ids.len() - 2], "reuse a bounded pair of IDs");
+                }
+                ids.push(id);
+                assert!(command_headers(&rendered_stateful(&kitty)).is_empty());
+            }
+            assert_eq!(ids[0], 0x0102_0304, "preserve the requested initial ID");
+        }
+    }
+
+    #[test]
+    fn stateful_unrendered_replacements_keep_the_hidden_id() {
+        use super::StatefulProtocolTrait;
+        for is_tmux in [false, true] {
+            let mut kitty = super::StatefulKitty::new(u32::MAX, is_tmux, false, false);
+            kitty.resize_encode(canvas(), Size::new(8, 2)).unwrap();
+            let visible = upload_id(&command_headers(&rendered_stateful(&kitty)));
+            for width in 9..14 {
+                kitty.resize_encode(canvas(), Size::new(width, 2)).unwrap();
+            }
+            let replacement = rendered_stateful(&kitty);
+            let hidden = upload_id(&command_headers(&replacement));
+            assert_ne!(hidden, visible, "coalescing must not select the visible ID");
+            assert_ne!(hidden, 0, "Kitty placeholders require a nonzero ID");
+            assert_eq!(placeholder_id(&replacement), hidden);
+            kitty.resize_encode(canvas(), Size::new(8, 2)).unwrap();
+            assert_eq!(
+                upload_id(&command_headers(&rendered_stateful(&kitty))),
+                visible,
+                "the third presentation reuses the first ID"
+            );
+        }
     }
 
     fn canvas() -> DynamicImage {
