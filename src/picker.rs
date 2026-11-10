@@ -477,6 +477,7 @@ fn interpret_parser_responses(
 
     let mut proto = None;
     let mut font_size = None;
+    let mut device_font_size = None;
 
     let mut cursor_position_reports = vec![];
     for response in &responses {
@@ -501,6 +502,10 @@ fn interpret_parser_responses(
                 }
                 Some(Capability::CellSize(*cell_size))
             }
+            Response::DeviceCellSize(w, h) => {
+                device_font_size = Some((*w, *h).into());
+                Some(Capability::CellSize(Some((*w, *h))))
+            }
             Response::CursorPositionReport(x, y) => {
                 cursor_position_reports.push((x, y));
                 None
@@ -511,6 +516,8 @@ fn interpret_parser_responses(
             capabilities.push(capability);
         }
     }
+    // Images are drawn in device pixels, so this wins over a `[16t` answer in points.
+    font_size = device_font_size.or(font_size);
 
     if let [(x1, _y1), (x2, _y2), (x3, _y3)] = cursor_position_reports[..] {
         // Test if the cursor advanced exactly two columns (instead of one) on both the width and
@@ -829,5 +836,18 @@ mod tests {
         ])
         .unwrap();
         assert!(!caps.contains(&Capability::TextSizingProtocol));
+    }
+
+    #[test]
+    fn test_interpret_parser_responses_device_cell_size_wins() {
+        let (_, font_size, _) = interpret_parser_responses(vec![
+            // Example response from iTerm2 on a Retina display.
+            Response::CellSize(Some((8, 17))),
+            Response::DeviceCellSize(16, 34),
+            Response::Status,
+        ])
+        .unwrap();
+        let font_size = font_size.unwrap();
+        assert_eq!((font_size.width, font_size.height), (16, 34));
     }
 }
