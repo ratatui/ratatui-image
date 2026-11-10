@@ -26,6 +26,8 @@ pub enum Response {
     KittyCompression,
     KittySharedMemory,
     CellSize(Option<(u16, u16)>),
+    /// iTerm2's `ReportCellSize`, scaled from points to device pixels.
+    DeviceCellSize(u16, u16),
     CursorPositionReport(u16, u16),
     Background(u8, u8, u8),
     Status,
@@ -225,6 +227,10 @@ impl Parser {
 
         const BEL: &str = "\u{7}";
 
+        // iTerm2 answers `[16t` in points but draws images at one pixel per device pixel. This
+        // reply also carries the scale (2 on Retina).
+        write!(buf, "{escape}]1337;ReportCellSize{BEL}").unwrap();
+
         if options.terminal_background_color_osc {
             // Background color
             write!(buf, "{escape}]11;?{BEL}").unwrap();
@@ -335,6 +341,11 @@ impl Parser {
             ResponseParseState::OSCResponse => {
                 self.data.push(next);
                 if next == '\u{7}' || self.data.ends_with("\x1b\\") {
+                    if let Some(fields) = self.data.strip_prefix("]1337;ReportCellSize=") {
+                        let response = device_cell_size(fields);
+                        self.restart();
+                        return response.into_iter().collect();
+                    }
                     let Some(rgb) = self.data.split("rgb:").nth(1) else {
                         return self.restart();
                     };
@@ -382,6 +393,22 @@ impl Parser {
         self.sequence = ResponseParseState::Unknown;
         vec![]
     }
+}
+
+/// Parse `height;width[;scale]`, in points, into the cell size in device pixels.
+fn device_cell_size(fields: &str) -> Option<Response> {
+    let fields = fields.trim_end_matches(['\x07', '\x1b', '\\']);
+    let mut values = fields.split(';').map(|value| value.parse::<f64>().ok());
+    let height = values.next()??;
+    let width = values.next()??;
+    let scale = values.next().flatten().unwrap_or(1.0);
+    let pixels = |points: f64| {
+        let pixels = (points * scale).round();
+        (1.0..=f64::from(u16::MAX))
+            .contains(&pixels)
+            .then_some(pixels as u16)
+    };
+    Some(Response::DeviceCellSize(pixels(width)?, pixels(height)?))
 }
 
 #[cfg(test)]
@@ -437,6 +464,40 @@ mod tests {
             caps,
             vec![Response::CellSize(Some((14, 7))), Response::Status]
         );
+    }
+
+    #[test]
+    fn test_parse_iterm2_report_cell_size() {
+        let caps = parse("\x1b[6;17;8t\x1b]1337;ReportCellSize=17;8;2\x1b\\\x1b[0n");
+        assert_eq!(
+            caps,
+            vec![
+                Response::CellSize(Some((8, 17))),
+                Response::DeviceCellSize(16, 34),
+                Response::Status,
+            ],
+        );
+    }
+
+    #[test]
+    fn test_parse_iterm2_report_cell_size_without_scale() {
+        let caps = parse("\x1b]1337;ReportCellSize=17.5;8.25\x07\x1b[0n");
+        assert_eq!(
+            caps,
+            vec![Response::DeviceCellSize(8, 18), Response::Status]
+        );
+    }
+
+    #[test]
+    fn test_parse_iterm2_report_cell_size_garbage() {
+        let caps = parse("\x1b]1337;ReportCellSize=0;x;2\x07\x1b[0n");
+        assert_eq!(caps, vec![Response::Status]);
+    }
+
+    #[test]
+    fn test_query_asks_for_iterm2_cell_size() {
+        let q = Parser::query(false, QueryStdioOptions::default());
+        assert!(q.contains("\x1b]1337;ReportCellSize\x07"), "{q:?}");
     }
 
     // #[test]
