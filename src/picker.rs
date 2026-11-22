@@ -254,6 +254,15 @@ impl Picker {
         self.background_color = background_color.map(Into::into);
     }
 
+    /// Stops compressing kitty images even though the terminal reported it can inflate them, such
+    /// as to skip compression for some images. See [`QueryStdioOptions::kitty_compression`].
+    ///
+    /// [`QueryStdioOptions::kitty_compression`]: cap_parser::QueryStdioOptions::kitty_compression
+    pub fn disable_kitty_compression(&mut self) {
+        self.capabilities
+            .retain(|capability| *capability != Capability::KittyCompression);
+    }
+
     /// Returns the capabilities detected by [Picker::from_query_stdio].
     pub fn capabilities(&self) -> &Vec<Capability> {
         &self.capabilities
@@ -714,8 +723,15 @@ fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; STDIN_READ_SIZE]) -> Result<us
 mod tests {
     use std::assert_eq;
 
+    use image::DynamicImage;
+    use ratatui::{
+        buffer::{Buffer, Cell},
+        layout::{Rect, Size},
+        widgets::Widget,
+    };
+
     use crate::{
-        FontSize,
+        FontSize, Image, Resize,
         picker::{Capability, Picker, ProtocolType, cap_parser::QueryStdioOptions},
     };
 
@@ -784,6 +800,37 @@ mod tests {
         assert_eq!(proto, ProtocolType::Iterm2);
         proto = proto.next();
         assert_eq!(proto, ProtocolType::Halfblocks);
+    }
+
+    #[test]
+    fn test_disable_kitty_compression_overrides_the_query() {
+        let mut picker = Picker {
+            font_size: FontSize::new(10, 20),
+            protocol_type: ProtocolType::Kitty,
+            background_color: None,
+            is_tmux: false,
+            capabilities: vec![Capability::KittyCompression],
+        };
+        let transmit = |picker: &Picker| {
+            let protocol = picker
+                .new_protocol(
+                    DynamicImage::new_rgba8(10, 20),
+                    Size::new(1, 1),
+                    Resize::Fit(None),
+                )
+                .unwrap();
+            let area = Rect::new(0, 0, 1, 1);
+            let mut buffer = Buffer::empty(area);
+            Image::new(&protocol).render(area, &mut buffer);
+            buffer
+                .content()
+                .iter()
+                .map(Cell::symbol)
+                .collect::<String>()
+        };
+        assert!(transmit(&picker).contains("o=z"));
+        picker.disable_kitty_compression();
+        assert!(!transmit(&picker).contains("o=z"));
     }
 
     #[test]
