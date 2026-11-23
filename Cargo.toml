@@ -7,7 +7,6 @@ authors = ["Benjamin Große <ste3ls@gmail.com>"]
 description = "An image widget for ratatui, supporting sixels, kitty, iterm2, and unicode-halfblocks"
 keywords = ["ratatui", "image", "sixel", "kitty", "iterm2"]
 repository = "https://github.com/ratatui/ratatui-image"
-homepage = "https://github.com/ratatui/ratatui-image"
 readme = "README.md"
 license = "MIT"
 exclude = ["assets/*"]
