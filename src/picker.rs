@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 pub mod cap_parser;
 
 #[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub enum Capability {
     /// Reports supporting kitty graphics protocol.
     Kitty,
@@ -59,9 +60,11 @@ pub enum Capability {
 const STDIN_READ_TIMEOUT_MILLIS: i32 = 2000;
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct Picker {
     font_size: FontSize,
     protocol_type: ProtocolType,
+    #[cfg_attr(feature = "serde", serde(with = "rgba"))]
     background_color: Option<Rgba<u8>>,
     pub(crate) is_tmux: bool,
     capabilities: Vec<Capability>,
@@ -615,6 +618,26 @@ fn poll_and_parse(
                 _ => responses.append(&mut more_caps),
             }
         }
+    }
+}
+
+#[cfg(feature = "serde")]
+mod rgba {
+    use image::Rgba;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(color: &Option<Rgba<u8>>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        color.map(|c| c.0).serialize(s)
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Option<Rgba<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Option::deserialize(d)?.map(Rgba))
     }
 }
 

@@ -139,8 +139,8 @@
 //!   false`). To only support a selection of image formats and cut down dependencies, disable this
 //!   feature, add `image` to your crate, and enable its features/formats as desired. See
 //!   <https://doc.rust-lang.org/cargo/reference/features.html#feature-unification/>.
-//! * `serde` for `#[derive]`s on [picker::ProtocolType] for convenience, because it might be
-//!   useful to save it in some user configuration.
+//! * `serde` adds `Serialize` and `Deserialize` implementations on [picker::ProtocolType] and
+//!   [picker::Picker].
 //! * `tokio` whether to use tokio's `UnboundedSender` in `ThreadProtocol`.
 //!
 //!
@@ -159,6 +159,8 @@ use ratatui::{
     layout::{Rect, Size},
     widgets::{StatefulWidget, Widget},
 };
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 pub mod errors;
 pub mod picker;
@@ -171,6 +173,7 @@ type Result<T> = std::result::Result<T, errors::Errors>;
 
 /// The terminal's font size in `(width, height)`
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct FontSize {
     pub width: u16,
     pub height: u16,
