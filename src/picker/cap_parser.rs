@@ -26,8 +26,6 @@ pub enum Response {
     KittyCompression,
     KittySharedMemory,
     CellSize(Option<(u16, u16)>),
-    /// iTerm2's `ReportCellSize`, scaled from points to device pixels.
-    DeviceCellSize(u16, u16),
     CursorPositionReport(u16, u16),
     Background(u8, u8, u8),
     Status,
@@ -345,29 +343,30 @@ impl Parser {
                         let response = device_cell_size(fields);
                         self.restart();
                         return response.into_iter().collect();
+                    } else {
+                        let Some(rgb) = self.data.split("rgb:").nth(1) else {
+                            return self.restart();
+                        };
+                        let rgb = rgb.trim_matches(|c| c == '\x07' || c == '\x1b' || c == '\\');
+                        let parts: Vec<&str> = rgb.split('/').collect();
+                        if parts.len() != 3 {
+                            return self.restart();
+                        }
+                        let (Some(r), Some(g), Some(b)) = (
+                            u16::from_str_radix(parts[0], 16).ok(),
+                            u16::from_str_radix(parts[1], 16).ok(),
+                            u16::from_str_radix(parts[2], 16).ok(),
+                        ) else {
+                            return self.restart();
+                        };
+                        self.restart();
+                        // Scale from 16-bit to 8-bit
+                        return vec![Response::Background(
+                            (r >> 8) as u8,
+                            (g >> 8) as u8,
+                            (b >> 8) as u8,
+                        )];
                     }
-                    let Some(rgb) = self.data.split("rgb:").nth(1) else {
-                        return self.restart();
-                    };
-                    let rgb = rgb.trim_matches(|c| c == '\x07' || c == '\x1b' || c == '\\');
-                    let parts: Vec<&str> = rgb.split('/').collect();
-                    if parts.len() != 3 {
-                        return self.restart();
-                    }
-                    let (Some(r), Some(g), Some(b)) = (
-                        u16::from_str_radix(parts[0], 16).ok(),
-                        u16::from_str_radix(parts[1], 16).ok(),
-                        u16::from_str_radix(parts[2], 16).ok(),
-                    ) else {
-                        return self.restart();
-                    };
-                    self.restart();
-                    // Scale from 16-bit to 8-bit
-                    return vec![Response::Background(
-                        (r >> 8) as u8,
-                        (g >> 8) as u8,
-                        (b >> 8) as u8,
-                    )];
                 }
             }
             ResponseParseState::KittyResponse => match next {
@@ -403,12 +402,14 @@ fn device_cell_size(fields: &str) -> Option<Response> {
     let width = values.next()??;
     let scale = values.next().flatten().unwrap_or(1.0);
     let pixels = |points: f64| {
-        let pixels = (points * scale).round();
+        // iTerm2 places `width=Npx` in `ceil(N / (points * scale))` cells, unrounded. Floor, so
+        // that N = cells * pixels never takes one cell more than the area.
+        let pixels = (points * scale).floor();
         (1.0..=f64::from(u16::MAX))
             .contains(&pixels)
             .then_some(pixels as u16)
     };
-    Some(Response::DeviceCellSize(pixels(width)?, pixels(height)?))
+    Some(Response::CellSize(Some((pixels(width)?, pixels(height)?))))
 }
 
 #[cfg(test)]
@@ -473,7 +474,7 @@ mod tests {
             caps,
             vec![
                 Response::CellSize(Some((8, 17))),
-                Response::DeviceCellSize(16, 34),
+                Response::CellSize(Some((16, 34))),
                 Response::Status,
             ],
         );
@@ -484,7 +485,7 @@ mod tests {
         let caps = parse("\x1b]1337;ReportCellSize=17.5;8.25\x07\x1b[0n");
         assert_eq!(
             caps,
-            vec![Response::DeviceCellSize(8, 18), Response::Status]
+            vec![Response::CellSize(Some((8, 17))), Response::Status]
         );
     }
 
