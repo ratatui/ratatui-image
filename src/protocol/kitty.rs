@@ -27,6 +27,25 @@ use ratatui::{buffer::Buffer, layout::Rect};
 
 use super::{ProtocolTrait, StatefulProtocolTrait};
 
+/// Options for how images are transmitted to the terminal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KittyOptions {
+    /// Wrap the escape sequences for tmux passthrough.
+    pub is_tmux: bool,
+    /// Compress the transmission (`o=z`).
+    pub compress: bool,
+    /// Transmit through a POSIX shared memory object instead of the escape sequence.
+    pub shared_memory: bool,
+    /// For [`StatefulKitty`]: upload a replacement image to a different ID than the one
+    /// currently displayed, instead of reusing it.
+    ///
+    /// Kitty deletes an image and its placements as soon as a retransmit to its ID begins, so
+    /// reusing the ID blanks the image until the whole upload has arrived. Alternating between
+    /// two IDs keeps the old image visible meanwhile, which matters on slow connections, at the
+    /// cost of the terminal holding up to two images per widget. Off by default.
+    pub alternate_ids: bool,
+}
+
 /// The character kitty reserves for image placeholders.
 const PLACEHOLDER: char = '\u{10EEEE}';
 
@@ -38,25 +57,26 @@ struct KittyProtoState {
 }
 
 impl KittyProtoState {
-    fn new(
-        img: &DynamicImage,
-        size: Size,
-        id: u32,
-        is_tmux: bool,
-        compress: bool,
-        smo: bool,
-    ) -> Result<Self> {
+    fn new(img: &DynamicImage, size: Size, id: u32, options: KittyOptions) -> Result<Self> {
+        // 0 is invalid for kitty, and id 1 would swap to 0 (1 ^ 1), so ids start at 2.
+        let id = id.max(2);
+
         // The only caller that holds a `DynamicImage`: every transmit path below
         // takes raw RGBA bytes plus dimensions, so the conversion happens once,
         // here, rather than once per path.
         let img_rgba8 = img.to_rgba8();
-        let transmit_str = transmit_or_shm(&img_rgba8, size, id, is_tmux, compress, smo)?;
+        let transmit_str = transmit_or_shm(&img_rgba8, size, id, options)?;
+        let mut state = Self::placeholder(id);
+        state.transmit_str = Some(transmit_str);
+        Ok(state)
+    }
+
+    fn placeholder(id: u32) -> KittyProtoState {
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
-        Ok(Self {
-            transmitted: Arc::new(AtomicBool::new(false)),
-            transmit_str: Some(transmit_str),
+        KittyProtoState {
             id: (id, Color::Rgb(id_r, id_g, id_b), u16::from(id_extra)),
-        })
+            ..Default::default()
+        }
     }
 
     // Produce the transmit sequence or None if it has already been produced before.
@@ -69,6 +89,23 @@ impl KittyProtoState {
             self.transmit_str.as_deref()
         }
     }
+
+    fn next(
+        &self,
+        img: DynamicImage,
+        size: Size,
+        options: KittyOptions,
+    ) -> Result<KittyProtoState> {
+        let transmitted = self.transmit_str.is_some() && self.transmitted.load(Ordering::SeqCst);
+        // A retransmit deletes the image already using that ID. If asked to, upload to the
+        // other ID, and only switch back after this state's transmit was returned by `render()`.
+        let id = if transmitted && options.alternate_ids {
+            self.id.0 ^ 1
+        } else {
+            self.id.0
+        };
+        KittyProtoState::new(&img, size, id, options)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -78,15 +115,8 @@ pub struct Kitty {
 }
 
 impl Kitty {
-    pub fn new(
-        image: DynamicImage,
-        size: Size,
-        id: u32,
-        is_tmux: bool,
-        compress: bool,
-        smo: bool,
-    ) -> Result<Self> {
-        let proto_state = KittyProtoState::new(&image, size, id, is_tmux, compress, smo)?;
+    pub fn new(image: DynamicImage, size: Size, id: u32, options: KittyOptions) -> Result<Self> {
+        let proto_state = KittyProtoState::new(&image, size, id, options)?;
         Ok(Self { proto_state, size })
     }
 
@@ -121,31 +151,17 @@ impl ProtocolTrait for Kitty {
 
 #[derive(Clone)]
 pub struct StatefulKitty {
-    next_id: u32,
     size: Size,
     proto_state: KittyProtoState,
-    is_tmux: bool,
-    compress: bool,
-    smo: bool,
+    options: KittyOptions,
 }
 
 impl StatefulKitty {
-    pub fn new(id: u32, is_tmux: bool, compress: bool, smo: bool) -> StatefulKitty {
-        let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
-        let mut next_id = rand::random();
-        while next_id == 0 || next_id == id {
-            next_id = rand::random();
-        }
+    pub fn new(id: u32, options: KittyOptions) -> StatefulKitty {
         StatefulKitty {
-            next_id,
             size: Size::default(),
-            proto_state: KittyProtoState {
-                id: (id, Color::Rgb(id_r, id_g, id_b), u16::from(id_extra)),
-                ..KittyProtoState::default()
-            },
-            is_tmux,
-            compress,
-            smo,
+            proto_state: KittyProtoState::placeholder(id),
+            options,
         }
     }
 }
@@ -165,22 +181,8 @@ impl ProtocolTrait for StatefulKitty {
 
 impl StatefulProtocolTrait for StatefulKitty {
     fn resize_encode(&mut self, img: DynamicImage, size: Size) -> Result<()> {
-        // A retransmit deletes the image already using that ID. Upload to the
-        // other ID, and only switch back after this state's transmit was rendered.
-        let transmitted = self.proto_state.transmit_str.is_some()
-            && self.proto_state.transmitted.load(Ordering::SeqCst);
-        let id = if transmitted {
-            self.next_id
-        } else {
-            self.proto_state.id.0
-        };
-        let proto_state =
-            KittyProtoState::new(&img, size, id, self.is_tmux, self.compress, self.smo)?;
-        if transmitted {
-            self.next_id = self.proto_state.id.0;
-        }
+        self.proto_state = self.proto_state.next(img, size, self.options)?;
         self.size = size;
-        self.proto_state = proto_state;
         Ok(())
     }
 }
@@ -248,17 +250,16 @@ fn zlib(raw: &[u8]) -> Vec<u8> {
 }
 
 #[cfg_attr(windows, allow(unused_variables))]
-fn transmit_or_shm(
-    img: &RgbaImage,
-    size: Size,
-    id: u32,
-    is_tmux: bool,
-    compress: bool,
-    smo: bool,
-) -> Result<String> {
+fn transmit_or_shm(img: &RgbaImage, size: Size, id: u32, options: KittyOptions) -> Result<String> {
+    let KittyOptions {
+        is_tmux,
+        compress,
+        shared_memory,
+        ..
+    } = options;
     let (bytes, w, h) = (img.as_raw(), img.width(), img.height());
     #[cfg(not(windows))]
-    if smo {
+    if shared_memory {
         return transmit_shm(bytes, w, h, size, id, is_tmux);
     }
     Ok(transmit_base64(bytes, w, h, size, id, is_tmux, compress))
@@ -803,7 +804,7 @@ fn diacritic(y: u16) -> char {
 
 #[cfg(test)]
 mod tests {
-    use super::{DIACRITICS, PLACEHOLDER, diacritic, render, transmit_base64};
+    use super::{DIACRITICS, KittyOptions, PLACEHOLDER, diacritic, render, transmit_base64};
     use image::{DynamicImage, RgbaImage};
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Rect, Size};
@@ -982,7 +983,12 @@ mod tests {
     fn stateful_replacements_never_upload_to_the_visible_id() {
         use super::StatefulProtocolTrait;
         for is_tmux in [false, true] {
-            let mut kitty = super::StatefulKitty::new(0x0102_0304, is_tmux, false, false);
+            let options = KittyOptions {
+                is_tmux,
+                alternate_ids: true,
+                ..Default::default()
+            };
+            let mut kitty = super::StatefulKitty::new(0x0102_0304, options);
             let mut ids = Vec::new();
             for generation in 0..6 {
                 kitty
@@ -1016,7 +1022,12 @@ mod tests {
     fn stateful_unrendered_replacements_keep_the_hidden_id() {
         use super::StatefulProtocolTrait;
         for is_tmux in [false, true] {
-            let mut kitty = super::StatefulKitty::new(u32::MAX, is_tmux, false, false);
+            let options = KittyOptions {
+                is_tmux,
+                alternate_ids: true,
+                ..Default::default()
+            };
+            let mut kitty = super::StatefulKitty::new(u32::MAX, options);
             kitty.resize_encode(canvas(), Size::new(8, 2)).unwrap();
             let visible = upload_id(&command_headers(&rendered_stateful(&kitty)));
             for width in 9..14 {
@@ -1033,6 +1044,72 @@ mod tests {
                 visible,
                 "the third presentation reuses the first ID"
             );
+        }
+    }
+
+    #[test]
+    fn stateful_replacements_reuse_the_id_by_default() {
+        use super::StatefulProtocolTrait;
+        let mut kitty = super::StatefulKitty::new(0x0102_0304, KittyOptions::default());
+        for generation in 0..4 {
+            kitty
+                .resize_encode(canvas(), Size::new(8 + generation, 2))
+                .unwrap();
+            let buf = rendered_stateful(&kitty);
+            let id = upload_id(&command_headers(&buf));
+            assert_eq!(id, 0x0102_0304, "the ID is never alternated");
+            assert_eq!(placeholder_id(&buf), id);
+        }
+    }
+
+    #[test]
+    fn picker_setter_reaches_the_stateful_protocol() {
+        use super::StatefulProtocolTrait;
+        use crate::picker::{Picker, ProtocolType};
+        use crate::protocol::StatefulProtocolType;
+        for alternate in [false, true] {
+            let mut picker = Picker::halfblocks();
+            picker.set_protocol_type(ProtocolType::Kitty);
+            picker.set_kitty_alternate_ids(alternate);
+            let StatefulProtocolType::Kitty(mut kitty) =
+                picker.new_resize_protocol(canvas()).protocol_type_owned()
+            else {
+                panic!("expected a kitty protocol");
+            };
+            let ids: Vec<u32> = (0..3)
+                .map(|generation| {
+                    kitty
+                        .resize_encode(canvas(), Size::new(8 + generation, 2))
+                        .unwrap();
+                    upload_id(&command_headers(&rendered_stateful(&kitty)))
+                })
+                .collect();
+            assert_eq!(ids[0] != ids[1], alternate, "alternate={alternate}");
+            assert_eq!(ids[0], ids[2], "alternate={alternate}");
+        }
+    }
+
+    #[test]
+    fn stateful_ids_below_two_are_clamped() {
+        use super::StatefulProtocolTrait;
+        for initial in [0, 1] {
+            let options = KittyOptions {
+                alternate_ids: true,
+                ..Default::default()
+            };
+            let mut kitty = super::StatefulKitty::new(initial, options);
+            let ids: Vec<u32> = (0..3)
+                .map(|generation| {
+                    kitty
+                        .resize_encode(canvas(), Size::new(8 + generation, 2))
+                        .unwrap();
+                    let buf = rendered_stateful(&kitty);
+                    let id = upload_id(&command_headers(&buf));
+                    assert_eq!(placeholder_id(&buf), id);
+                    id
+                })
+                .collect();
+            assert_eq!(ids, [2, 3, 2], "initial={initial}");
         }
     }
 

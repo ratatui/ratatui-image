@@ -15,7 +15,7 @@ use crate::{
         Protocol, StatefulProtocol, StatefulProtocolType,
         halfblocks::Halfblocks,
         iterm2::Iterm2,
-        kitty::{Kitty, StatefulKitty},
+        kitty::{Kitty, KittyOptions, StatefulKitty},
         sixel::Sixel,
     },
 };
@@ -68,6 +68,8 @@ pub struct Picker {
     background_color: Option<Rgba<u8>>,
     pub(crate) is_tmux: bool,
     capabilities: Vec<Capability>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    kitty_alternate_ids: bool,
 }
 
 /// Serde-friendly protocol-type enum for [Picker].
@@ -160,6 +162,7 @@ impl Picker {
                     protocol_type,
                     is_tmux,
                     capabilities: caps,
+                    kitty_alternate_ids: false,
                 })
             }
             // The terminal did not answer the query, but it may still be possible to figure out
@@ -200,6 +203,7 @@ impl Picker {
             protocol_type: ProtocolType::Halfblocks,
             is_tmux,
             capabilities: Vec::new(),
+            kitty_alternate_ids: false,
         }
     }
 
@@ -225,6 +229,7 @@ impl Picker {
             protocol_type,
             is_tmux,
             capabilities: Vec::new(),
+            kitty_alternate_ids: false,
         }
     }
 
@@ -257,6 +262,29 @@ impl Picker {
         self.background_color = background_color.map(Into::into);
     }
 
+    /// Kitty only: transmit a replacement image under a different ID than the displayed one.
+    /// Off by default.
+    ///
+    /// Overwriting an image may make the terminal clear the previous one as soon as the first
+    /// chunk of the new one arrives, leaving a gap until the last chunk. Using a different ID
+    /// avoids that gap. May be useful over slow links such as ssh, in combination with
+    /// compression. The terminal holds up to two copies of the image while on. No effect with
+    /// [`QueryStdioOptions::kitty_shared_memory_object`].
+    ///
+    /// Only protocols created after this call are affected.
+    pub fn set_kitty_alternate_ids(&mut self, alternate_ids: bool) {
+        self.kitty_alternate_ids = alternate_ids;
+    }
+
+    fn kitty_options(&self) -> KittyOptions {
+        KittyOptions {
+            is_tmux: self.is_tmux,
+            compress: self.capabilities.contains(&Capability::KittyCompression),
+            shared_memory: self.capabilities.contains(&Capability::KittySharedMemory),
+            alternate_ids: self.kitty_alternate_ids,
+        }
+    }
+
     /// Returns the capabilities detected by [Picker::from_query_stdio].
     pub fn capabilities(&self) -> &Vec<Capability> {
         &self.capabilities
@@ -273,9 +301,7 @@ impl Picker {
                 image,
                 size,
                 rand::random(),
-                self.is_tmux,
-                self.capabilities.contains(&Capability::KittyCompression),
-                self.capabilities.contains(&Capability::KittySharedMemory),
+                self.kitty_options(),
             )?)),
             ProtocolType::Iterm2 => Ok(Protocol::ITerm2(Iterm2::new(image, size, self.is_tmux)?)),
         }
@@ -310,12 +336,9 @@ impl Picker {
                 is_tmux: self.is_tmux,
                 ..Sixel::default()
             }),
-            ProtocolType::Kitty => StatefulProtocolType::Kitty(StatefulKitty::new(
-                random(),
-                self.is_tmux,
-                self.capabilities.contains(&Capability::KittyCompression),
-                self.capabilities.contains(&Capability::KittySharedMemory),
-            )),
+            ProtocolType::Kitty => {
+                StatefulProtocolType::Kitty(StatefulKitty::new(random(), self.kitty_options()))
+            }
             ProtocolType::Iterm2 => StatefulProtocolType::ITerm2(Iterm2 {
                 is_tmux: self.is_tmux,
                 ..Iterm2::default()
@@ -334,6 +357,7 @@ static DEFAULT_PICKER: Picker = Picker {
     protocol_type: ProtocolType::Halfblocks,
     is_tmux: false,
     capabilities: Vec::new(),
+    kitty_alternate_ids: false,
 };
 
 fn detect_tmux_and_outer_protocol_from_env() -> (bool, Option<ProtocolType>) {
@@ -734,6 +758,8 @@ fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; STDIN_READ_SIZE]) -> Result<us
 #[cfg(test)]
 mod tests {
     use std::assert_eq;
+
+    use crate::protocol::kitty::KittyOptions;
     #[cfg(not(windows))]
     use std::os::fd::OwnedFd;
 
@@ -855,6 +881,57 @@ mod tests {
     }
 
     #[test]
+    fn test_kitty_options_follow_picker_state() {
+        let mut picker = Picker::halfblocks();
+        picker.is_tmux = true;
+        assert_eq!(
+            picker.kitty_options(),
+            KittyOptions {
+                is_tmux: true,
+                ..KittyOptions::default()
+            }
+        );
+
+        picker.capabilities = vec![Capability::KittyCompression, Capability::KittySharedMemory];
+        picker.set_kitty_alternate_ids(true);
+        assert_eq!(
+            picker.kitty_options(),
+            KittyOptions {
+                is_tmux: true,
+                compress: true,
+                shared_memory: true,
+                alternate_ids: true,
+            }
+        );
+
+        picker.capabilities = vec![Capability::KittySharedMemory];
+        picker.set_kitty_alternate_ids(false);
+        assert_eq!(
+            picker.kitty_options(),
+            KittyOptions {
+                is_tmux: true,
+                compress: false,
+                shared_memory: true,
+                alternate_ids: false,
+            }
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_picker_without_kitty_alternate_ids_still_loads() {
+        let mut picker = Picker::halfblocks();
+        picker.set_kitty_alternate_ids(true);
+        let mut json = serde_json::to_value(&picker).unwrap();
+        assert_eq!(json["kitty_alternate_ids"], true);
+
+        // A picker serialized before the field existed.
+        json.as_object_mut().unwrap().remove("kitty_alternate_ids");
+        let loaded: Picker = serde_json::from_value(json).unwrap();
+        assert!(!loaded.kitty_options().alternate_ids);
+    }
+
+    #[test]
     fn test_tmux_detected_reflects_is_tmux() {
         let mut picker = Picker {
             font_size: FontSize::new(10, 20),
@@ -862,6 +939,7 @@ mod tests {
             background_color: None,
             is_tmux: true,
             capabilities: Vec::new(),
+            kitty_alternate_ids: false,
         };
         assert!(picker.tmux_detected());
 
