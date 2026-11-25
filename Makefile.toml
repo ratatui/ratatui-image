@@ -13,9 +13,22 @@ dependencies = [
 command = "cargo"
 args = ["fmt", "--all", "--", "--check"]
 
+# Keep the feature sets in sync with `featureMatrix` in flake.nix.
 [tasks.clippy]
-command = "cargo"
-args = ["clippy", "--no-deps", "--tests", "--all-features", "--", "-D", "warnings"]
+clear = true
+script = '''
+set -e
+for features in \
+  "" \
+  "--no-default-features --features image-defaults,crossterm" \
+  "--no-default-features --features chafa-static,image-defaults,crossterm" \
+  "--features serde,tokio,chafa-dyn" \
+  "--features thread-example"
+do
+  echo "clippy: ${features:-default}"
+  cargo clippy $features --all-targets -- --deny warnings
+done
+'''
 
 [tasks.check]
 command = "cargo"

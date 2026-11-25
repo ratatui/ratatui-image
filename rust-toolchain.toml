@@ -1,0 +1,7 @@
+# Single source of truth for the toolchain: read by rustup (non-nix checkouts),
+# by flake.nix via rust-overlay (devshell, `nix flake check`, windows build) and
+# by CI. Bump it here only.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

@@ -17,8 +17,14 @@
     rust-overlay,
     ...
   }:
-    flake-utils.lib.eachDefaultSystem (system: let
-      pkgs = nixpkgs.legacyPackages.${system};
+    # Not `eachDefaultSystem`: its list includes x86_64-darwin, which nixpkgs 26.11
+    # no longer supports (evaluating it throws), so e.g. `nix flake show` fails.
+    # Re-add it if we pin a nixpkgs that still supports Intel Macs (<= 26.05).
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (system: let
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [(import rust-overlay)];
+      };
       inherit (pkgs) lib;
 
       # Build chafa with static library support (uses autotools)
@@ -56,7 +62,9 @@
         BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
       };
 
-      craneLib = crane.mkLib pkgs;
+      # Toolchain pinned in rust-toolchain.toml (shared with rustup and CI).
+      rustToolchain = p: p.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+      craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
       unfilteredRoot = ./.;
       src = lib.fileset.toSource {
@@ -160,7 +168,7 @@
         };
       };
       craneLibWindows = (crane.mkLib pkgsWindows).overrideToolchain (p:
-        p.rust-bin.stable.latest.default.override {
+        (rustToolchain p).override {
           targets = [ "x86_64-pc-windows-gnu" ];
         }
       );
@@ -181,6 +189,9 @@
         {
           default = ratatui-image;
           demo = ratatui-demo;
+        }
+        # The windows cross build needs wine, which nixpkgs only provides on linux.
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           windows = ratatui-image-windows;
         }
         // screenshotTests;
