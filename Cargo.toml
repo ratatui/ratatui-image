@@ -85,6 +85,9 @@ tokio = { version = "1.45.1", features = ["macros", "rt", "rt-multi-thread"] }
 insta = "1.44.3"
 criterion = "0.5.1"
 
+[target.'cfg(not(windows))'.dev-dependencies]
+rustix = { version = "^0.38.4", features = ["pty"] }
+
 [[bench]]
 name = "protocols"
 harness = false

@@ -561,30 +561,28 @@ fn query_with_timeout(
             .unwrap_or_else(|| (rustix::stdio::stdin(), rustix::stdio::stdout()));
 
         let disable_raw_mode = enable_raw_mode(stdin)?;
-
         let query = Parser::query(is_tmux, options);
-
-        rustix::io::write(stdout, query.as_bytes())?;
-
-        let responses = poll_and_parse(stdin, timeout_ms)?;
+        let responses = rustix::io::write(stdout, query.as_bytes())
+            .map_err(Errors::from)
+            .and_then(|_| poll_and_parse(stdin, timeout_ms));
 
         disable_raw_mode()?;
-        interpret_parser_responses(responses)
+        interpret_parser_responses(responses?)
     }
     #[cfg(windows)]
     {
         use std::io::Write as _;
         let disable_raw_mode = enable_raw_mode()?;
-
         let query = Parser::query(is_tmux, options);
-
-        io::stdout().write_all(query.as_bytes())?;
-        io::stdout().flush()?;
-
-        let responses = poll_and_parse(timeout_ms)?;
+        let mut stdout = io::stdout();
+        let responses = stdout
+            .write_all(query.as_bytes())
+            .and_then(|_| stdout.flush())
+            .map_err(Errors::from)
+            .and_then(|_| poll_and_parse(timeout_ms));
 
         disable_raw_mode()?;
-        interpret_parser_responses(responses)
+        interpret_parser_responses(responses?)
     }
 }
 
@@ -736,6 +734,8 @@ fn poll_stdin(timeout_ms: i32, charbuf: &mut [u8; STDIN_READ_SIZE]) -> Result<us
 #[cfg(test)]
 mod tests {
     use std::assert_eq;
+    #[cfg(not(windows))]
+    use std::os::fd::OwnedFd;
 
     use crate::{
         FontSize,
@@ -796,6 +796,51 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    fn pty() -> (OwnedFd, OwnedFd) {
+        use rustix::fs::{Mode, OFlags, open};
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("open a pty");
+        grantpt(&master).expect("grant the pty");
+        unlockpt(&master).expect("unlock the pty");
+        let name = ptsname(&master, Vec::new()).expect("name the pty");
+        let slave = open(
+            name.as_c_str(),
+            OFlags::RDWR | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .expect("open the pty slave");
+        (master, slave)
+    }
+
+    #[cfg(not(windows))]
+    fn stdio(slave: &OwnedFd) -> Option<(OwnedFd, OwnedFd)> {
+        Some((slave.try_clone().unwrap(), slave.try_clone().unwrap()))
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_query_timeout_restores_terminal() {
+        use rustix::termios::{LocalModes, tcgetattr};
+
+        use crate::errors::Errors;
+
+        let (_master, slave) = pty();
+        let modes = LocalModes::ICANON | LocalModes::ECHO;
+        assert!(tcgetattr(&slave).unwrap().local_modes.contains(modes));
+
+        let options = QueryStdioOptions {
+            timeout_ms: 1,
+            stdio: stdio(&slave),
+            ..Default::default()
+        };
+        let result = super::query_with_timeout(false, options);
+
+        assert!(matches!(result, Err(Errors::NoStdinResponse)));
+        assert!(tcgetattr(&slave).unwrap().local_modes.contains(modes));
+    }
+
     #[test]
     fn test_cycle_protocol() {
         let mut proto = ProtocolType::Halfblocks;
@@ -826,7 +871,15 @@ mod tests {
 
     #[test]
     fn test_from_query_stdio_no_hang() {
-        let _ = Picker::from_query_stdio();
+        #[cfg(not(windows))]
+        let (_master, slave) = pty();
+        let options = QueryStdioOptions {
+            timeout_ms: 1,
+            #[cfg(not(windows))]
+            stdio: stdio(&slave),
+            ..Default::default()
+        };
+        let _ = Picker::from_query_stdio_with_options(options);
     }
 
     #[test]
