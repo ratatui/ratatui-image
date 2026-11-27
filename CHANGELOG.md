@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [12.0.0-rc.4](https://github.com/ratatui/ratatui-image/compare/v12.0.0-rc.3...v12.0.0-rc.4) - 2026-11-27
+
+### Other
+
+- Restore terminal if stdio query times out
+- Delete redundant homepage from Cargo.toml
+- Add serde derive for Picker, etc.
+
 ## [12.0.0-rc.3](https://github.com/ratatui/ratatui-image/compare/v12.0.0-rc.2...v12.0.0-rc.3) - 2026-10-17
 
 ### Other
