@@ -499,6 +499,8 @@ fn interpret_parser_responses(
             Response::KittyCompression => Some(Capability::KittyCompression),
             Response::KittySharedMemory => Some(Capability::KittySharedMemory),
             Response::CellSize(cell_size) => {
+                // The last answer wins: iTerm2's `ReportCellSize` in device pixels is queried
+                // after `[16t`, which iTerm2 answers in points.
                 if let Some((w, h)) = cell_size {
                     font_size = Some((*w, *h).into());
                 }
@@ -905,5 +907,18 @@ mod tests {
         ])
         .unwrap();
         assert!(!caps.contains(&Capability::TextSizingProtocol));
+    }
+
+    #[test]
+    fn test_interpret_parser_responses_last_cell_size_wins() {
+        let (_, font_size, _) = interpret_parser_responses(vec![
+            // Example response from iTerm2 on a Retina display.
+            Response::CellSize(Some((8, 17))),
+            Response::CellSize(Some((16, 34))),
+            Response::Status,
+        ])
+        .unwrap();
+        let font_size = font_size.unwrap();
+        assert_eq!((font_size.width, font_size.height), (16, 34));
     }
 }
