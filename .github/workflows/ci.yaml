@@ -25,12 +25,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: 1.88.0
-          profile: default
-          override: true
+      - name: Install rust (version from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: davidB/rust-cargo-make@v1
       - name: Make readme
         run: cargo make readme

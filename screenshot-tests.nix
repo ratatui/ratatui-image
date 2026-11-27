@@ -143,7 +143,7 @@ let
 
     screenshot-test-blackbox = makeScreenshotTest {
       terminal = "blackbox";
-      terminalCommand = "blackbox -c \"${self.packages.${system}.demo}/bin/demo --tmp-demo-ready\"";
+      terminalCommand = "blackbox-terminal -c \"${self.packages.${system}.demo}/bin/demo --tmp-demo-ready\"";
       terminalPackages = [ pkgs.blackbox-terminal ];
     };
 
